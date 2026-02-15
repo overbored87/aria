@@ -1,0 +1,26 @@
+# render.yaml — Blueprint for Render deployment
+# Go to https://render.com → New → Blueprint → connect your repo
+
+services:
+  - type: worker
+    name: aria-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.main
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_ID
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: USER_TIMEZONE
+        value: Asia/Singapore
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PYTHON_VERSION
+        value: "3.12"
