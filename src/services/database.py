@@ -1,8 +1,7 @@
-"""Supabase database operations — conversations, memories, scheduling."""
+"""Supabase database operations."""
 
 from __future__ import annotations
 from datetime import datetime, timedelta
-from typing import Any
 
 from supabase import create_client, Client
 
@@ -20,10 +19,9 @@ def get_db() -> Client:
     return _client
 
 
-# ── User Operations ──────────────────────────────────────────
+# ── User ─────────────────────────────────────────────────────
 
 def ensure_user(telegram_user) -> dict:
-    """Upsert user record from Telegram user object."""
     db = get_db()
     data = {
         "id": telegram_user.id,
@@ -35,10 +33,9 @@ def ensure_user(telegram_user) -> dict:
     return result.data[0] if result.data else data
 
 
-# ── Conversation Operations ──────────────────────────────────
+# ── Conversations ────────────────────────────────────────────
 
 def save_message(user_id: int, role: str, content: str, metadata: dict | None = None) -> str:
-    """Save a message and return its UUID."""
     db = get_db()
     row = {
         "user_id": user_id,
@@ -52,10 +49,6 @@ def save_message(user_id: int, role: str, content: str, metadata: dict | None = 
 
 
 def get_recent_conversation(user_id: int, token_budget: int | None = None) -> list[dict]:
-    """
-    Fetch recent messages within token budget.
-    Returns list of {"role": ..., "content": ...} oldest-first.
-    """
     budget = token_budget or cfg.token_budget
     db = get_db()
     result = (
@@ -76,12 +69,11 @@ def get_recent_conversation(user_id: int, token_budget: int | None = None) -> li
         total_tokens += tokens
         messages.append({"role": row["role"], "content": row["content"]})
 
-    messages.reverse()  # oldest first
+    messages.reverse()
     return messages
 
 
 def get_message_count(user_id: int, since_days: int = 1) -> int:
-    """Count messages in last N days."""
     db = get_db()
     since = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
     result = (
@@ -94,16 +86,9 @@ def get_message_count(user_id: int, since_days: int = 1) -> int:
     return result.count or 0
 
 
-# ── Memory Operations ────────────────────────────────────────
+# ── Memories ─────────────────────────────────────────────────
 
-def save_memory(
-    user_id: int,
-    category: str,
-    content: str,
-    importance: int = 5,
-    source_message_id: str | None = None,
-) -> str | None:
-    """Store an extracted memory. Returns UUID or None."""
+def save_memory(user_id: int, category: str, content: str, importance: int = 5, source_message_id: str | None = None) -> str | None:
     db = get_db()
     row = {
         "user_id": user_id,
@@ -120,7 +105,6 @@ def save_memory(
 
 
 def get_active_memories(user_id: int, limit: int = 30) -> list[dict]:
-    """Fetch active memories sorted by importance then recency."""
     db = get_db()
     result = (
         db.table("memories")
@@ -154,7 +138,7 @@ def deactivate_memory(memory_id: str) -> None:
     get_db().table("memories").update({"is_active": False}).eq("id", memory_id).execute()
 
 
-# ── Conversation Summaries ───────────────────────────────────
+# ── Summaries ────────────────────────────────────────────────
 
 def save_summary(user_id: int, summary: str, period_start: str, period_end: str, message_count: int) -> None:
     get_db().table("conversation_summaries").insert({
@@ -181,10 +165,7 @@ def get_recent_summaries(user_id: int, limit: int = 5) -> list[dict]:
 
 # ── Scheduled Messages ───────────────────────────────────────
 
-def create_scheduled_message(
-    user_id: int, msg_type: str, scheduled_for: str,
-    content: str | None = None, context: dict | None = None,
-) -> None:
+def create_scheduled_message(user_id: int, msg_type: str, scheduled_for: str, content: str | None = None, context: dict | None = None) -> None:
     get_db().table("scheduled_messages").insert({
         "user_id": user_id,
         "type": msg_type,
@@ -215,7 +196,7 @@ def mark_scheduled_sent(message_id: str) -> None:
     ).eq("id", message_id).execute()
 
 
-# ── Proactive Message Log ────────────────────────────────────
+# ── Proactive Log ────────────────────────────────────────────
 
 def log_proactive_message(user_id: int, message_type: str) -> None:
     get_db().table("proactive_message_log").insert({

@@ -1,8 +1,4 @@
-"""Claude API integration — Aria's brain.
-
-Handles system prompt construction, context windowing, response generation,
-memory extraction, proactive message generation, and conversation summarization.
-"""
+"""Claude API integration — Aria's brain."""
 
 from __future__ import annotations
 import re
@@ -29,14 +25,7 @@ def get_client() -> anthropic.Anthropic:
     return _client
 
 
-# ─── System Prompt Builder ──────────────────────────────────
-
-
-def _build_system_prompt(
-    memories: list[dict],
-    summaries: list[dict],
-    user_preferences: dict | None = None,
-) -> str:
+def _build_system_prompt(memories: list[dict], summaries: list[dict], user_preferences: dict | None = None) -> str:
     tod = time_of_day()
     current_time = format_user_time()
     name = cfg.user_name
@@ -49,10 +38,7 @@ def _build_system_prompt(
 
     summary_block = ""
     if summaries:
-        lines = []
-        for s in summaries:
-            end = s.get("period_end", "")[:10]
-            lines.append(f"- ({end}): {s['summary']}")
+        lines = [f"- ({s.get('period_end', '')[:10]}): {s['summary']}" for s in summaries]
         summary_block = f"\n## Recent Conversation Summaries\n" + "\n".join(lines)
 
     prefs_block = ""
@@ -77,7 +63,7 @@ def _build_system_prompt(
 - Break up longer responses with line breaks between thoughts
 - No bullet points unless listing specific items
 - Don't start every message with a greeting — vary your openings
-- Match the energy of {name}'s message (quick question → quick answer)
+- Match the energy of {name}'s message (quick question = quick answer)
 
 ## Context
 - Current time for {name}: {current_time} ({tod})
@@ -106,11 +92,7 @@ Only extract genuinely useful info, not casual chit-chat. Multiple tags OK if ne
 - Use Telegram-compatible markdown formatting (bold with *, italic with _, code with `)"""
 
 
-# ─── Response Generation ────────────────────────────────────
-
-
 def generate_response(user_id: int, user_message: str) -> str:
-    """Generate Aria's response to a user message with full context."""
     try:
         memories = get_active_memories(user_id)
         summaries = get_recent_summaries(user_id, 3)
@@ -119,9 +101,7 @@ def generate_response(user_id: int, user_message: str) -> str:
         system = _build_system_prompt(memories, summaries)
         messages = history + [{"role": "user", "content": user_message}]
 
-        log.info(
-            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories"
-        )
+        log.info(f"Calling Claude: {len(history)} history msgs, {len(memories)} memories")
 
         response = get_client().messages.create(
             model=cfg.claude_model,
@@ -130,21 +110,14 @@ def generate_response(user_id: int, user_message: str) -> str:
             messages=messages,
         )
 
-        full_text = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-
+        full_text = "".join(block.text for block in response.content if block.type == "text")
         clean_text, extracted = _parse_memories(full_text)
 
-        # Save extracted memories
         for mem in extracted:
             save_memory(user_id, mem["category"], mem["content"], mem["importance"])
 
         if extracted:
-            log.info(
-                f"Extracted {len(extracted)} memories: "
-                + ", ".join(m["category"] for m in extracted)
-            )
+            log.info(f"Extracted {len(extracted)} memories: {', '.join(m['category'] for m in extracted)}")
 
         return clean_text
 
@@ -158,8 +131,6 @@ def generate_response(user_id: int, user_message: str) -> str:
         log.error(f"Unexpected error in generate_response: {e}", exc_info=True)
         return "Something glitched on my end. Try again?"
 
-
-# ─── Proactive Message Generation ───────────────────────────
 
 _TYPE_PROMPTS = {
     "morning_checkin": (
@@ -188,10 +159,7 @@ _TYPE_PROMPTS = {
 }
 
 
-def generate_proactive_message(
-    user_id: int, msg_type: str, context: dict | None = None
-) -> str | None:
-    """Generate a proactive/scheduled message."""
+def generate_proactive_message(user_id: int, msg_type: str, context: dict | None = None) -> str | None:
     try:
         context = context or {}
         memories = get_active_memories(user_id, 15)
@@ -201,8 +169,7 @@ def generate_proactive_message(
 
         memory_block = (
             "\n".join(f"- [{m['category']}] {m['content']}" for m in memories)
-            if memories
-            else "Getting to know him still."
+            if memories else "Getting to know him still."
         )
         summary_block = "\n".join(s["summary"] for s in summaries) if summaries else ""
 
@@ -210,8 +177,7 @@ def generate_proactive_message(
         prompt = template.format(name=name, **context)
 
         system = (
-            f"You are Aria, {name}'s personal assistant. "
-            f"Current time: {current_time}.\n\n"
+            f"You are Aria, {name}'s personal assistant. Current time: {current_time}.\n\n"
             f"Your personality: warm, slightly flirty, competent, concise. "
             f"You're messaging on Telegram so keep it short.\n\n"
             f"What you know about {name}:\n{memory_block}"
@@ -225,10 +191,7 @@ def generate_proactive_message(
             messages=[{"role": "user", "content": prompt}],
         )
 
-        text = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-        # Strip any memory tags from proactive messages
+        text = "".join(block.text for block in response.content if block.type == "text")
         return re.sub(r"<memory[^>]*>.*?</memory>", "", text, flags=re.DOTALL).strip()
 
     except Exception as e:
@@ -236,11 +199,7 @@ def generate_proactive_message(
         return None
 
 
-# ─── Conversation Summary ───────────────────────────────────
-
-
 def generate_summary(messages: list[dict]) -> str | None:
-    """Summarize a batch of conversation messages."""
     try:
         convo_text = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
         response = get_client().messages.create(
@@ -253,15 +212,11 @@ def generate_summary(messages: list[dict]) -> str | None:
             ),
             messages=[{"role": "user", "content": convo_text}],
         )
-        return "".join(
-            block.text for block in response.content if block.type == "text"
-        )
+        return "".join(block.text for block in response.content if block.type == "text")
     except Exception as e:
         log.error(f"Summary generation failed: {e}")
         return None
 
-
-# ─── Memory Tag Parser ──────────────────────────────────────
 
 _MEMORY_RE = re.compile(
     r'<memory\s+category="([^"]+)"\s+importance="(\d+)">(.*?)</memory>',
@@ -270,7 +225,6 @@ _MEMORY_RE = re.compile(
 
 
 def _parse_memories(text: str) -> tuple[str, list[dict]]:
-    """Extract <memory> tags and return (clean_text, list_of_memories)."""
     extracted = []
     for m in _MEMORY_RE.finditer(text):
         extracted.append({

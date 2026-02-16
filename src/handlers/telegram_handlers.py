@@ -1,6 +1,4 @@
-"""Telegram message handlers — routing, auth, response flow."""
-
-from __future__ import annotations
+"""Telegram message handlers."""
 
 from telegram import Update
 from telegram.ext import (
@@ -19,26 +17,16 @@ from src.services.summarizer import maybe_summarize
 
 
 def register_handlers(app: Application) -> None:
-    """Attach all handlers to the Telegram Application."""
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("memories", _cmd_memories))
     app.add_handler(CommandHandler("clear", _cmd_clear))
     app.add_handler(CommandHandler("help", _cmd_help))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message)
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
     log.info("Telegram handlers registered")
 
 
-# ─── Auth Guard ──────────────────────────────────────────────
-
-
 def _is_authorized(update: Update) -> bool:
-    """Only allow the configured user."""
     return update.effective_user and update.effective_user.id == cfg.allowed_user_id
-
-
-# ─── Command Handlers ───────────────────────────────────────
 
 
 async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -48,7 +36,6 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     ensure_user(update.effective_user)
     name = cfg.user_name
-
     await update.message.reply_text(
         f"Hey {name} 👋\n\n"
         f"I'm Aria, your personal assistant. I'm here to help you stay on top of "
@@ -62,7 +49,6 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         return
-
     await update.message.reply_text(
         "*Commands:*\n"
         "/start — Introduction\n"
@@ -91,16 +77,17 @@ async def _cmd_memories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     grouped: dict[str, list[str]] = {}
     for m in memories:
-        cat = m["category"]
-        grouped.setdefault(cat, []).append(m["content"])
+        grouped.setdefault(m["category"], []).append(m["content"])
+
+    emoji_map = {
+        "personal": "👤", "preference": "⭐", "goal": "🎯",
+        "task": "📋", "relationship": "💛", "habit": "🔄",
+        "work": "💻", "health": "🏃", "interest": "🎮", "other": "📝",
+    }
 
     lines = ["*Here's what I remember about you:*\n"]
     for cat, items in grouped.items():
-        emoji = {
-            "personal": "👤", "preference": "⭐", "goal": "🎯",
-            "task": "📋", "relationship": "💛", "habit": "🔄",
-            "work": "💻", "health": "🏃", "interest": "🎮", "other": "📝",
-        }.get(cat, "📝")
+        emoji = emoji_map.get(cat, "📝")
         lines.append(f"\n{emoji} *{cat.title()}*")
         for item in items:
             lines.append(f"  • {item}")
@@ -111,18 +98,13 @@ async def _cmd_memories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         return
-
     await update.message.reply_text(
         "Conversation context refreshed. Your memories are still intact — "
         "I haven't forgotten anything important 😊"
     )
 
 
-# ─── Main Message Handler ───────────────────────────────────
-
-
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process incoming text messages."""
     if not _is_authorized(update):
         await update.message.reply_text("I'm spoken for 😏")
         return
@@ -130,31 +112,22 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     user_id = user.id
     text = update.message.text.strip()
-
     if not text:
         return
 
     log.info(f"Message from {user.first_name}: {text[:80]}...")
 
-    # Ensure user exists
     ensure_user(user)
-
-    # Save user message
     save_message(user_id, "user", text, metadata={
         "message_id": update.message.message_id,
         "chat_id": update.effective_chat.id,
     })
 
-    # Show typing indicator
     await update.effective_chat.send_action("typing")
 
-    # Generate response
     response_text = generate_response(user_id, text)
-
-    # Save assistant response
     save_message(user_id, "assistant", response_text)
 
-    # Send response — try with Markdown first, fallback to plain
     try:
         await update.message.reply_text(response_text, parse_mode="Markdown")
     except Exception:
@@ -164,5 +137,4 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             log.error(f"Failed to send message: {e}")
             await update.message.reply_text("Something went wrong sending my response. Try again?")
 
-    # Background: check if we need to summarize
     await maybe_summarize(user_id)

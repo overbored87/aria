@@ -1,7 +1,7 @@
 """Central configuration — reads env vars once, validates, exports."""
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -18,9 +18,9 @@ class Config:
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     claude_model: str = "claude-sonnet-4-5-20250514"
     max_tokens: int = 1024
-    token_budget: int = 8000       # max tokens for conversation history
-    max_messages: int = 50         # max messages to fetch for context
-    summary_threshold: int = 40    # trigger summary after N messages in 24h
+    token_budget: int = 8000
+    max_messages: int = 50
+    summary_threshold: int = 40
 
     # Supabase
     supabase_url: str = os.getenv("SUPABASE_URL", "")
@@ -29,8 +29,8 @@ class Config:
     # User defaults
     user_timezone: str = os.getenv("USER_TIMEZONE", "Asia/Singapore")
     user_name: str = "Kieran"
-    quiet_start: int = 23   # 11 PM
-    quiet_end: int = 7      # 7 AM
+    quiet_start: int = 23
+    quiet_end: int = 7
     max_proactive_per_day: int = 3
 
     # App

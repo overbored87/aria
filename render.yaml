@@ -1,6 +1,3 @@
-# render.yaml — Blueprint for Render deployment
-# Go to https://render.com → New → Blueprint → connect your repo
-
 services:
   - type: worker
     name: aria-bot

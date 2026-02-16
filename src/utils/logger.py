@@ -1,8 +1,9 @@
-"""Logging setup — structured, concise, one-stop import."""
+"""Logging setup."""
 
 import logging
 import sys
 from src.config import cfg
+
 
 def get_logger(name: str = "aria") -> logging.Logger:
     logger = logging.getLogger(name)
@@ -16,5 +17,6 @@ def get_logger(name: str = "aria") -> logging.Logger:
         logger.addHandler(handler)
         logger.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
     return logger
+
 
 log = get_logger()
