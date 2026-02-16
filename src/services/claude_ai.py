@@ -43,6 +43,7 @@ def _build_system_prompt(
 ) -> str:
     tod = time_of_day()
     current_time = format_user_time()
+    today_str = now_user().strftime("%Y-%m-%d")
     name = cfg.user_name
 
     memory_block = (
@@ -129,6 +130,7 @@ Rules for reminders:
 - You can set multiple reminders in one response
 - Examples of trigger phrases: "remind me to...", "set a reminder for...", "don't let me forget to...", "ping me at..."
 - Current time is {current_time} — use this to determine if a time is today or tomorrow
+- Today's date is {today_str}. ALWAYS use the correct year ({today_str[:4]}) when including dates
 - If {name} says a relative time like "in 2 hours" or "in 30 minutes", calculate the actual time
 
 ## Context
@@ -458,8 +460,16 @@ def parse_reminders(text: str) -> tuple[str, list[dict]]:
             if date_str:
                 year, month, day = map(int, date_str.split("-"))
                 dt = datetime(year, month, day, hour, minute, tzinfo=tz)
+
+                # Guard: if Claude hallucinated a past date, fix it
+                if dt < now:
+                    # Keep the time, but use today (or tomorrow if time passed)
+                    dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    if dt <= now:
+                        dt += timedelta(days=1)
+                    log.warning(f"Reminder date was in the past — corrected to {dt.isoformat()}")
             else:
-                # Today, or tomorrow if time already passed
+                # No date given: today, or tomorrow if time already passed
                 dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
                 if dt <= now:
                     dt += timedelta(days=1)

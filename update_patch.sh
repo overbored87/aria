@@ -1,12 +1,11 @@
 #!/bin/bash
 # ============================================================
-# Aria Bot — Update Patch: Serper Web Search + Reminders
+# Aria Bot — Update Patch: Serper Search + Reminders (date fix)
 # Run from your repo root: bash update_patch.sh
 # ============================================================
 set -e
-echo "🔧 Patching Aria Bot with Serper web search, reminders, and multi-message support..."
+echo "🔧 Patching Aria Bot..."
 
-# ── src/config.py ──
 cat > src/config.py << 'PYEOF'
 """Central configuration — reads env vars once, validates, exports."""
 
@@ -69,7 +68,63 @@ cfg = Config()
 
 PYEOF
 
-# ── src/services/web_search.py ──
+cat > src/utils/time_helpers.py << 'PYEOF'
+"""Timezone-aware helpers for Singapore time."""
+
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+from src.config import cfg
+
+_tz = ZoneInfo(cfg.user_timezone)
+
+
+def now_user() -> datetime:
+    """Current datetime in user's timezone."""
+    return datetime.now(_tz)
+
+
+def user_hour() -> int:
+    """Current hour (0-23) in user's timezone."""
+    return now_user().hour
+
+
+def is_quiet_hours() -> bool:
+    """True if inside quiet window (wraps around midnight)."""
+    h = user_hour()
+    if cfg.quiet_start > cfg.quiet_end:
+        return h >= cfg.quiet_start or h < cfg.quiet_end
+    return cfg.quiet_start <= h < cfg.quiet_end
+
+
+def format_user_time(dt: datetime | None = None) -> str:
+    """Human-readable time string in user's locale, including year."""
+    dt = dt or now_user()
+    return dt.strftime("%a %d %b %Y, %I:%M %p")
+
+
+def today_date_str() -> str:
+    """YYYY-MM-DD in user's timezone."""
+    return now_user().strftime("%Y-%m-%d")
+
+
+def time_of_day() -> str:
+    h = user_hour()
+    if h < 12:
+        return "morning"
+    if h < 17:
+        return "afternoon"
+    if h < 21:
+        return "evening"
+    return "night"
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate (≈4 chars/token)."""
+    return max(1, len(text) // 4)
+
+PYEOF
+
 cat > src/services/web_search.py << 'PYEOF'
 """Web search via Serper.dev (Google Search API).
 
@@ -187,7 +242,6 @@ def format_results_for_context(results: list[dict], max_results: int = 5) -> str
 
 PYEOF
 
-# ── src/services/claude_ai.py ──
 cat > src/services/claude_ai.py << 'PYEOF'
 """Claude API integration — Aria's brain.
 
@@ -234,6 +288,7 @@ def _build_system_prompt(
 ) -> str:
     tod = time_of_day()
     current_time = format_user_time()
+    today_str = now_user().strftime("%Y-%m-%d")
     name = cfg.user_name
 
     memory_block = (
@@ -320,6 +375,7 @@ Rules for reminders:
 - You can set multiple reminders in one response
 - Examples of trigger phrases: "remind me to...", "set a reminder for...", "don't let me forget to...", "ping me at..."
 - Current time is {current_time} — use this to determine if a time is today or tomorrow
+- Today's date is {today_str}. ALWAYS use the correct year ({today_str[:4]}) when including dates
 - If {name} says a relative time like "in 2 hours" or "in 30 minutes", calculate the actual time
 
 ## Context
@@ -649,8 +705,16 @@ def parse_reminders(text: str) -> tuple[str, list[dict]]:
             if date_str:
                 year, month, day = map(int, date_str.split("-"))
                 dt = datetime(year, month, day, hour, minute, tzinfo=tz)
+
+                # Guard: if Claude hallucinated a past date, fix it
+                if dt < now:
+                    # Keep the time, but use today (or tomorrow if time passed)
+                    dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    if dt <= now:
+                        dt += timedelta(days=1)
+                    log.warning(f"Reminder date was in the past — corrected to {dt.isoformat()}")
             else:
-                # Today, or tomorrow if time already passed
+                # No date given: today, or tomorrow if time already passed
                 dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
                 if dt <= now:
                     dt += timedelta(days=1)
@@ -677,7 +741,6 @@ def _attach_reminder_confirmations(text: str, reminders: list[dict]) -> str:
 
 PYEOF
 
-# ── src/services/scheduler.py ──
 cat > src/services/scheduler.py << 'PYEOF'
 """Proactive messaging scheduler — cron-based check-ins and follow-ups.
 
@@ -913,7 +976,6 @@ async def _send_reminder(user_id: int, message: str) -> None:
 
 PYEOF
 
-# ── src/handlers/telegram_handlers.py ──
 cat > src/handlers/telegram_handlers.py << 'PYEOF'
 """Telegram message handlers — routing, auth, response flow."""
 
@@ -1142,17 +1204,13 @@ PYEOF
 
 
 echo ""
-echo "✅ Patch applied!"
+echo "✅ Patch applied! Files updated:"
+echo "  src/config.py                (Serper config)"
+echo "  src/utils/time_helpers.py    (year in time format)"
+echo "  src/services/web_search.py   (Serper.dev Google Search)"
+echo "  src/services/claude_ai.py    (search + reminders + date fix)"
+echo "  src/services/scheduler.py    (schedule_reminder)"
+echo "  src/handlers/telegram_handlers.py (reminder wiring)"
 echo ""
-echo "Files updated:"
-echo "  src/config.py                      (Serper config)"
-echo "  src/services/web_search.py         (NEW — Serper.dev Google Search)"
-echo "  src/services/claude_ai.py          (web search + reminders + two-pass)"
-echo "  src/services/scheduler.py          (schedule_reminder for timed reminders)"
-echo "  src/handlers/telegram_handlers.py  (reminder wiring + multi-msg)"
-echo ""
-echo "Next steps:"
-echo "  1. Sign up free at https://serper.dev → get API key"
-echo "  2. Add to .env and Render env vars:"
-echo "     SERPER_API_KEY=your_key_here"
-echo "  3. git add -A && git commit -m 'Add Serper web search + reminders' && git push"
+echo "Add SERPER_API_KEY to .env and Render, then:"
+echo "  git add -A && git commit -m 'Serper search + reminders' && git push"
