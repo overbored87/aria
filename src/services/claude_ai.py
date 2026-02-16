@@ -181,7 +181,7 @@ def generate_response(user_id: int, user_message: str) -> str:
         messages = history + [{"role": "user", "content": user_message}]
 
         log.info(
-            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories"
+            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories, time={format_user_time()}"
         )
 
         response = get_client().messages.create(

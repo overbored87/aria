@@ -1,11 +1,6 @@
 #!/bin/bash
-# ============================================================
-# Aria Bot — Update Patch: Serper Search + Reminders (date fix)
-# Run from your repo root: bash update_patch.sh
-# ============================================================
 set -e
 echo "🔧 Patching Aria Bot..."
-
 cat > src/config.py << 'PYEOF'
 """Central configuration — reads env vars once, validates, exports."""
 
@@ -426,7 +421,7 @@ def generate_response(user_id: int, user_message: str) -> str:
         messages = history + [{"role": "user", "content": user_message}]
 
         log.info(
-            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories"
+            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories, time={format_user_time()}"
         )
 
         response = get_client().messages.create(
@@ -1202,15 +1197,4 @@ async def _send_split_response(
 
 PYEOF
 
-
-echo ""
-echo "✅ Patch applied! Files updated:"
-echo "  src/config.py                (Serper config)"
-echo "  src/utils/time_helpers.py    (year in time format)"
-echo "  src/services/web_search.py   (Serper.dev Google Search)"
-echo "  src/services/claude_ai.py    (search + reminders + date fix)"
-echo "  src/services/scheduler.py    (schedule_reminder)"
-echo "  src/handlers/telegram_handlers.py (reminder wiring)"
-echo ""
-echo "Add SERPER_API_KEY to .env and Render, then:"
-echo "  git add -A && git commit -m 'Serper search + reminders' && git push"
+echo "✅ Done. git add -A && git commit -m 'time fix + debug log' && git push"
