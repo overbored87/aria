@@ -1,19 +1,26 @@
-"""Claude API integration — Aria's brain."""
+"""Claude API integration — Aria's brain.
+
+Handles system prompt construction, context windowing, response generation,
+memory extraction, proactive message generation, and conversation summarization.
+"""
 
 from __future__ import annotations
 import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import anthropic
 
 from src.config import cfg
 from src.utils.logger import log
-from src.utils.time_helpers import format_user_time, time_of_day
+from src.utils.time_helpers import format_user_time, time_of_day, now_user
 from src.services.database import (
     get_recent_conversation,
     get_active_memories,
     get_recent_summaries,
     save_memory,
 )
+from src.services import web_search
 
 _client: anthropic.Anthropic | None = None
 
@@ -25,7 +32,15 @@ def get_client() -> anthropic.Anthropic:
     return _client
 
 
-def _build_system_prompt(memories: list[dict], summaries: list[dict], user_preferences: dict | None = None) -> str:
+# ─── System Prompt Builder ──────────────────────────────────
+
+
+def _build_system_prompt(
+    memories: list[dict],
+    summaries: list[dict],
+    user_preferences: dict | None = None,
+    search_results: str | None = None,
+) -> str:
     tod = time_of_day()
     current_time = format_user_time()
     name = cfg.user_name
@@ -38,13 +53,22 @@ def _build_system_prompt(memories: list[dict], summaries: list[dict], user_prefe
 
     summary_block = ""
     if summaries:
-        lines = [f"- ({s.get('period_end', '')[:10]}): {s['summary']}" for s in summaries]
+        lines = []
+        for s in summaries:
+            end = s.get("period_end", "")[:10]
+            lines.append(f"- ({end}): {s['summary']}")
         summary_block = f"\n## Recent Conversation Summaries\n" + "\n".join(lines)
 
     prefs_block = ""
     if user_preferences:
         lines = [f"- {k}: {v}" for k, v in user_preferences.items()]
         prefs_block = f"\n## {name}'s Preferences\n" + "\n".join(lines)
+
+    search_block = ""
+    if search_results:
+        search_block = f"\n## Web Search Results\n{search_results}"
+
+    web_search_available = bool(cfg.serper_api_key)
 
     return f"""You are Aria, {name}'s personal AI assistant on Telegram.
 
@@ -60,10 +84,52 @@ def _build_system_prompt(memories: list[dict], summaries: list[dict], user_prefe
 
 ## Communication Style
 - Short, punchy messages appropriate for Telegram
-- Break up longer responses with line breaks between thoughts
+- IMPORTANT: Separate distinct thoughts with a blank line (double newline). Each chunk separated by a blank line will be sent as a separate Telegram message, which feels more natural and conversational. For example:
+  "Hey, nice work on that dashboard update!
+
+  btw did you end up fixing the date picker bug?
+
+  I was thinking about your goal to ship by Friday — want me to help you break that down?"
+  This becomes THREE separate messages. Use this naturally — not every response needs multiple messages. Quick answers can be one chunk.
 - No bullet points unless listing specific items
 - Don't start every message with a greeting — vary your openings
 - Match the energy of {name}'s message (quick question = quick answer)
+
+## Images
+You can send images! When it would enhance your message — a relevant meme, reference image, diagram, motivational image, etc. — include an image tag:
+<image url="https://example.com/image.jpg">optional caption</image>
+
+Rules for images:
+- Only use direct image URLs (ending in .jpg, .png, .gif, .webp, or from known image hosts like imgur, giphy)
+- Use sparingly — only when it genuinely adds to the conversation
+- Place the image tag on its own line where you want it to appear in the conversation flow
+- Great for: reactions, visual references, celebrating wins, mood-setting
+- Don't force it — most messages don't need images
+
+## Web Search
+{"You have web search available! When " + name + " asks about current events, facts you're unsure of, recommendations, news, or anything you'd need to look up — include a search tag:" if web_search_available else "Web search is not currently configured."}
+{"<search>your search query</search>" if web_search_available else ""}
+{'''
+Rules for search:
+- Place the <search> tag BEFORE your response text — search results will be provided and you'll generate your answer with them
+- Use natural, concise search queries (like you'd type into Google)
+- Search when you genuinely don't know something or need current info
+- Don't search for things you already know or that are in your memories
+- You can include multiple <search> tags for complex queries
+- For image searches, use: <image_search>your query</image_search> to find relevant images to send''' if web_search_available else ""}
+
+## Reminders
+When {name} asks you to remind him about something at a specific time, include a reminder tag at the END of your response:
+<reminder time="HH:MM" date="YYYY-MM-DD">[reminder message]</reminder>
+
+Rules for reminders:
+- time is in 24-hour format in {name}'s timezone ({cfg.user_timezone})
+- date is optional — if omitted, assumes today (or tomorrow if the time has already passed today)
+- The reminder message should be written as you'd say it to {name} — warm and personal, not robotic
+- You can set multiple reminders in one response
+- Examples of trigger phrases: "remind me to...", "set a reminder for...", "don't let me forget to...", "ping me at..."
+- Current time is {current_time} — use this to determine if a time is today or tomorrow
+- If {name} says a relative time like "in 2 hours" or "in 30 minutes", calculate the actual time
 
 ## Context
 - Current time for {name}: {current_time} ({tod})
@@ -75,6 +141,7 @@ def _build_system_prompt(memories: list[dict], summaries: list[dict], user_prefe
 {memory_block}
 {summary_block}
 {prefs_block}
+{search_block}
 
 ## Memory Extraction
 When {name} shares something important — a goal, preference, deadline, personal detail, or commitment — note it by including a <memory> tag at the END of your response (after your visible reply):
@@ -92,7 +159,17 @@ Only extract genuinely useful info, not casual chit-chat. Multiple tags OK if ne
 - Use Telegram-compatible markdown formatting (bold with *, italic with _, code with `)"""
 
 
+# ─── Response Generation ────────────────────────────────────
+
+
 def generate_response(user_id: int, user_message: str) -> str:
+    """Generate Aria's response with search and reminder support.
+
+    Flow:
+    1. First pass: ask Claude to respond (may include <search> tags)
+    2. If search tags found: execute searches, re-call Claude with results
+    3. Parse out <memory>, <reminder>, <image>, <search> tags from final response
+    """
     try:
         memories = get_active_memories(user_id)
         summaries = get_recent_summaries(user_id, 3)
@@ -101,7 +178,9 @@ def generate_response(user_id: int, user_message: str) -> str:
         system = _build_system_prompt(memories, summaries)
         messages = history + [{"role": "user", "content": user_message}]
 
-        log.info(f"Calling Claude: {len(history)} history msgs, {len(memories)} memories")
+        log.info(
+            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories"
+        )
 
         response = get_client().messages.create(
             model=cfg.claude_model,
@@ -110,14 +189,75 @@ def generate_response(user_id: int, user_message: str) -> str:
             messages=messages,
         )
 
-        full_text = "".join(block.text for block in response.content if block.type == "text")
+        full_text = "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+
+        # ── Check for search requests ────────────────────────
+        search_queries = _SEARCH_RE.findall(full_text)
+        image_search_queries = _IMAGE_SEARCH_RE.findall(full_text)
+
+        if search_queries or image_search_queries:
+            # Execute searches
+            search_results_text = ""
+            if search_queries:
+                for query in search_queries:
+                    results = web_search.search(query.strip())
+                    search_results_text += f"\n### Results for: {query.strip()}\n"
+                    search_results_text += web_search.format_results_for_context(results)
+
+            image_results = []
+            if image_search_queries:
+                for query in image_search_queries:
+                    imgs = web_search.search_images(query.strip(), num_results=3)
+                    if imgs:
+                        image_results.extend(imgs)
+                        search_results_text += f"\n### Image results for: {query.strip()}\n"
+                        for img in imgs:
+                            search_results_text += f"- {img['title']}: {img['image_url']}\n"
+
+            # Second pass with search results
+            system_with_search = _build_system_prompt(
+                memories, summaries, search_results=search_results_text
+            )
+
+            response2 = get_client().messages.create(
+                model=cfg.claude_model,
+                max_tokens=cfg.max_tokens,
+                system=system_with_search,
+                messages=messages,
+            )
+
+            full_text = "".join(
+                block.text for block in response2.content if block.type == "text"
+            )
+
+        # ── Strip search tags from final output ──────────────
+        full_text = _SEARCH_RE.sub("", full_text)
+        full_text = _IMAGE_SEARCH_RE.sub("", full_text)
+
+        # ── Parse memories ───────────────────────────────────
         clean_text, extracted = _parse_memories(full_text)
 
         for mem in extracted:
             save_memory(user_id, mem["category"], mem["content"], mem["importance"])
 
         if extracted:
-            log.info(f"Extracted {len(extracted)} memories: {', '.join(m['category'] for m in extracted)}")
+            log.info(
+                f"Extracted {len(extracted)} memories: "
+                + ", ".join(m["category"] for m in extracted)
+            )
+
+        # ── Parse reminders ──────────────────────────────────
+        clean_text, reminders = parse_reminders(clean_text)
+
+        # Schedule reminders (attach to response so handler can process)
+        if reminders:
+            clean_text = _attach_reminder_confirmations(clean_text, reminders)
+
+        # Stash reminders on the module level so the handler can pick them up
+        _last_reminders.clear()
+        _last_reminders.extend(reminders)
 
         return clean_text
 
@@ -131,6 +271,19 @@ def generate_response(user_id: int, user_message: str) -> str:
         log.error(f"Unexpected error in generate_response: {e}", exc_info=True)
         return "Something glitched on my end. Try again?"
 
+
+# Temp storage for reminders between generate_response and handler
+_last_reminders: list[dict] = []
+
+
+def get_pending_reminders() -> list[dict]:
+    """Pop reminders extracted from the last response."""
+    reminders = list(_last_reminders)
+    _last_reminders.clear()
+    return reminders
+
+
+# ─── Proactive Message Generation ───────────────────────────
 
 _TYPE_PROMPTS = {
     "morning_checkin": (
@@ -159,7 +312,10 @@ _TYPE_PROMPTS = {
 }
 
 
-def generate_proactive_message(user_id: int, msg_type: str, context: dict | None = None) -> str | None:
+def generate_proactive_message(
+    user_id: int, msg_type: str, context: dict | None = None
+) -> str | None:
+    """Generate a proactive/scheduled message."""
     try:
         context = context or {}
         memories = get_active_memories(user_id, 15)
@@ -169,7 +325,8 @@ def generate_proactive_message(user_id: int, msg_type: str, context: dict | None
 
         memory_block = (
             "\n".join(f"- [{m['category']}] {m['content']}" for m in memories)
-            if memories else "Getting to know him still."
+            if memories
+            else "Getting to know him still."
         )
         summary_block = "\n".join(s["summary"] for s in summaries) if summaries else ""
 
@@ -177,7 +334,8 @@ def generate_proactive_message(user_id: int, msg_type: str, context: dict | None
         prompt = template.format(name=name, **context)
 
         system = (
-            f"You are Aria, {name}'s personal assistant. Current time: {current_time}.\n\n"
+            f"You are Aria, {name}'s personal assistant. "
+            f"Current time: {current_time}.\n\n"
             f"Your personality: warm, slightly flirty, competent, concise. "
             f"You're messaging on Telegram so keep it short.\n\n"
             f"What you know about {name}:\n{memory_block}"
@@ -191,7 +349,10 @@ def generate_proactive_message(user_id: int, msg_type: str, context: dict | None
             messages=[{"role": "user", "content": prompt}],
         )
 
-        text = "".join(block.text for block in response.content if block.type == "text")
+        text = "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+        # Strip any memory tags from proactive messages
         return re.sub(r"<memory[^>]*>.*?</memory>", "", text, flags=re.DOTALL).strip()
 
     except Exception as e:
@@ -199,7 +360,11 @@ def generate_proactive_message(user_id: int, msg_type: str, context: dict | None
         return None
 
 
+# ─── Conversation Summary ───────────────────────────────────
+
+
 def generate_summary(messages: list[dict]) -> str | None:
+    """Summarize a batch of conversation messages."""
     try:
         convo_text = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
         response = get_client().messages.create(
@@ -212,19 +377,44 @@ def generate_summary(messages: list[dict]) -> str | None:
             ),
             messages=[{"role": "user", "content": convo_text}],
         )
-        return "".join(block.text for block in response.content if block.type == "text")
+        return "".join(
+            block.text for block in response.content if block.type == "text"
+        )
     except Exception as e:
         log.error(f"Summary generation failed: {e}")
         return None
 
+
+# ─── Tag Parsers ─────────────────────────────────────────────
 
 _MEMORY_RE = re.compile(
     r'<memory\s+category="([^"]+)"\s+importance="(\d+)">(.*?)</memory>',
     re.DOTALL,
 )
 
+_IMAGE_RE = re.compile(
+    r'<image\s+url="([^"]+)">(.*?)</image>',
+    re.DOTALL,
+)
+
+_SEARCH_RE = re.compile(
+    r'<search>(.*?)</search>',
+    re.DOTALL,
+)
+
+_IMAGE_SEARCH_RE = re.compile(
+    r'<image_search>(.*?)</image_search>',
+    re.DOTALL,
+)
+
+_REMINDER_RE = re.compile(
+    r'<reminder\s+time="(\d{1,2}:\d{2})"(?:\s+date="(\d{4}-\d{2}-\d{2})")?>(.*?)</reminder>',
+    re.DOTALL,
+)
+
 
 def _parse_memories(text: str) -> tuple[str, list[dict]]:
+    """Extract <memory> tags and return (clean_text, list_of_memories)."""
     extracted = []
     for m in _MEMORY_RE.finditer(text):
         extracted.append({
@@ -234,3 +424,63 @@ def _parse_memories(text: str) -> tuple[str, list[dict]]:
         })
     clean = _MEMORY_RE.sub("", text).strip()
     return clean, extracted
+
+
+def parse_images(text: str) -> tuple[str, list[dict]]:
+    """Extract <image> tags and return (clean_text, list_of_images)."""
+    images = []
+    for m in _IMAGE_RE.finditer(text):
+        images.append({
+            "url": m.group(1).strip(),
+            "caption": m.group(2).strip() or None,
+        })
+    clean = _IMAGE_RE.sub("", text).strip()
+    return clean, images
+
+
+def parse_reminders(text: str) -> tuple[str, list[dict]]:
+    """Extract <reminder> tags and return (clean_text, list_of_reminders).
+
+    Each reminder: {"time": "HH:MM", "date": "YYYY-MM-DD" or None, "message": str, "dt": datetime}
+    """
+    tz = ZoneInfo(cfg.user_timezone)
+    now = now_user()
+    reminders = []
+
+    for m in _REMINDER_RE.finditer(text):
+        time_str = m.group(1).strip()
+        date_str = m.group(2).strip() if m.group(2) else None
+        message = m.group(3).strip()
+
+        try:
+            hour, minute = map(int, time_str.split(":"))
+
+            if date_str:
+                year, month, day = map(int, date_str.split("-"))
+                dt = datetime(year, month, day, hour, minute, tzinfo=tz)
+            else:
+                # Today, or tomorrow if time already passed
+                dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if dt <= now:
+                    dt += timedelta(days=1)
+
+            reminders.append({
+                "time": time_str,
+                "date": dt.strftime("%Y-%m-%d"),
+                "message": message,
+                "dt": dt,
+            })
+            log.info(f"Reminder parsed: '{message[:50]}' at {dt.isoformat()}")
+
+        except Exception as e:
+            log.error(f"Failed to parse reminder: {e}")
+
+    clean = _REMINDER_RE.sub("", text).strip()
+    return clean, reminders
+
+
+def _attach_reminder_confirmations(text: str, reminders: list[dict]) -> str:
+    """If Aria didn't already confirm the reminder, we don't add anything —
+    the system prompt tells her to confirm naturally in her response."""
+    return text
+
