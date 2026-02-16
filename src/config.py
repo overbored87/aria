@@ -16,7 +16,7 @@ class Config:
 
     # Anthropic
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
-    claude_model: str = "claude-sonnet-4-5-20250514"
+    claude_model: str = "claude-sonnet-4-5-20250929"
     max_tokens: int = 1024
     token_budget: int = 8000       # max tokens for conversation history
     max_messages: int = 50         # max messages to fetch for context
