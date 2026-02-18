@@ -21,6 +21,7 @@ from src.services.database import (
     save_memory,
 )
 from src.services import web_search
+from src.services import dashboard as dashboard_svc
 
 _client: anthropic.Anthropic | None = None
 
@@ -68,6 +69,15 @@ def _build_system_prompt(
     search_block = ""
     if search_results:
         search_block = f"\n## Web Search Results\n{search_results}"
+
+    dashboard_block = ""
+    if dashboard_svc.is_configured():
+        grouped = dashboard_svc.get_latest_by_category(limit_per_category=3)
+        if grouped:
+            dashboard_block = (
+                f"\n## {name}'s Dashboard Data (from his personal tracking system)\n"
+                + dashboard_svc.format_for_context(grouped)
+            )
 
     web_search_available = bool(cfg.serper_api_key)
 
@@ -144,6 +154,7 @@ Rules for reminders:
 {summary_block}
 {prefs_block}
 {search_block}
+{dashboard_block}
 
 ## Memory Extraction
 When {name} shares something important — a goal, preference, deadline, personal detail, or commitment — note it by including a <memory> tag at the END of your response (after your visible reply):
@@ -310,6 +321,14 @@ _TYPE_PROMPTS = {
         "Send {name} a brief, genuine affirmation or encouragement. "
         "Make it personal based on what you know about him, not generic positivity fluff."
     ),
+    "dashboard_insights": (
+        "Analyze {name}'s personal dashboard data below and send him a concise daily briefing. "
+        "Cover the most interesting or actionable insights across whatever categories are present. "
+        "Be specific with numbers and trends — don't be vague. Keep it punchy and Telegram-friendly. "
+        "If you spot something noteworthy (a spending spike, a goal milestone, a pattern), call it out. "
+        "Use your personality — make data feel personal, not like a spreadsheet.\n\n"
+        "Dashboard data:\n{dashboard_data}"
+    ),
     "custom": "{prompt}",
 }
 
@@ -359,6 +378,59 @@ def generate_proactive_message(
 
     except Exception as e:
         log.error(f"Failed to generate proactive message: {e}", exc_info=True)
+        return None
+
+
+def generate_dashboard_insights(user_id: int) -> str | None:
+    """Pull dashboard data and generate a daily insights message."""
+    if not dashboard_svc.is_configured():
+        log.debug("Dashboard not configured — skipping insights")
+        return None
+
+    try:
+        grouped = dashboard_svc.get_latest_by_category(limit_per_category=10)
+        if not grouped:
+            log.info("No dashboard data found for insights")
+            return None
+
+        dashboard_data = dashboard_svc.format_for_context(grouped)
+        memories = get_active_memories(user_id, 15)
+        name = cfg.user_name
+        current_time = format_user_time()
+
+        memory_block = (
+            "\n".join(f"- [{m['category']}] {m['content']}" for m in memories)
+            if memories else ""
+        )
+
+        template = _TYPE_PROMPTS["dashboard_insights"]
+        prompt = template.format(name=name, dashboard_data=dashboard_data)
+
+        system = (
+            f"You are Aria, {name}'s personal assistant. "
+            f"Current time: {current_time}.\n\n"
+            f"Your personality: warm, slightly flirty, competent, concise. "
+            f"You're messaging on Telegram so keep it punchy. "
+            f"Separate distinct thoughts with blank lines (each becomes a separate message).\n\n"
+            f"What you know about {name}:\n{memory_block}"
+        )
+
+        response = get_client().messages.create(
+            model=cfg.claude_model,
+            max_tokens=600,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+        clean = re.sub(r"<memory[^>]*>.*?</memory>", "", text, flags=re.DOTALL).strip()
+        log.info(f"Dashboard insights generated: {len(clean)} chars, {len(grouped)} categories")
+        return clean
+
+    except Exception as e:
+        log.error(f"Failed to generate dashboard insights: {e}", exc_info=True)
         return None
 
 

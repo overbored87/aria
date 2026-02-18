@@ -31,10 +31,14 @@ class Config:
     user_name: str = "Kieran"
     quiet_start: int = 23   # 11 PM
     quiet_end: int = 7      # 7 AM
-    max_proactive_per_day: int = 3
+    max_proactive_per_day: int = 5
 
     # Serper.dev (optional — web search disabled if not set)
     serper_api_key: str = os.getenv("SERPER_API_KEY", "")
+
+    # Dashboard Supabase (optional — separate DB for personal dashboard)
+    dashboard_supabase_url: str = os.getenv("DASHBOARD_SUPABASE_URL", "")
+    dashboard_supabase_key: str = os.getenv("DASHBOARD_SUPABASE_KEY", "")
 
     # App
     log_level: str = os.getenv("LOG_LEVEL", "INFO")

@@ -13,7 +13,7 @@ from apscheduler.triggers.date import DateTrigger
 from src.config import cfg
 from src.utils.logger import log
 from src.utils.time_helpers import is_quiet_hours
-from src.services.claude_ai import generate_proactive_message
+from src.services.claude_ai import generate_proactive_message, generate_dashboard_insights
 from src.services.database import (
     get_pending_scheduled_messages,
     mark_scheduled_sent,
@@ -58,6 +58,15 @@ def init_scheduler(bot_app) -> AsyncIOScheduler:
         CronTrigger(hour=14, minute=0, day_of_week="mon-fri", timezone=tz),
         args=[user_id],
         id="task_followup",
+        replace_existing=True,
+    )
+
+    # Daily dashboard insights at 8:00 AM
+    _scheduler.add_job(
+        _send_dashboard_insights,
+        CronTrigger(hour=8, minute=0, timezone=tz),
+        args=[user_id],
+        id="dashboard_insights",
         replace_existing=True,
     )
 
@@ -130,6 +139,48 @@ async def _send_task_followup(user_id: int) -> None:
 
     except Exception as e:
         log.error(f"Task follow-up error: {e}", exc_info=True)
+
+
+# ─── Dashboard Insights ─────────────────────────────────────
+
+
+async def _send_dashboard_insights(user_id: int) -> None:
+    """Generate and send daily dashboard insights."""
+    try:
+        if is_quiet_hours():
+            log.info("Skipping dashboard insights — quiet hours")
+            return
+
+        daily_count = get_daily_proactive_count(user_id)
+        if daily_count >= cfg.max_proactive_per_day:
+            log.info("Skipping dashboard insights — daily limit")
+            return
+
+        message = generate_dashboard_insights(user_id)
+        if not message:
+            log.info("No dashboard insights generated (not configured or no data)")
+            return
+
+        # Split on double newlines for multi-message feel
+        import asyncio
+        import re
+        chunks = [c.strip() for c in re.split(r"\n\n+", message) if c.strip()]
+
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                await asyncio.sleep(0.5)
+            try:
+                await _bot_app.bot.send_message(
+                    chat_id=user_id, text=chunk, parse_mode="Markdown"
+                )
+            except Exception:
+                await _bot_app.bot.send_message(chat_id=user_id, text=chunk)
+
+        log_proactive_message(user_id, "dashboard_insights")
+        log.info(f"Dashboard insights sent: {len(chunks)} messages")
+
+    except Exception as e:
+        log.error(f"Dashboard insights error: {e}", exc_info=True)
 
 
 # ─── DB-Scheduled Messages ──────────────────────────────────

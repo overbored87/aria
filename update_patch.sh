@@ -1,6 +1,391 @@
 #!/bin/bash
 set -e
-echo "🔧 Patching Aria Bot..."
+echo "🔧 Patching Aria Bot — Dashboard Insights..."
+
+cat > src/config.py << 'PYEOF'
+"""Central configuration — reads env vars once, validates, exports."""
+
+import os
+from dataclasses import dataclass, field
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+@dataclass(frozen=True)
+class Config:
+    # Telegram
+    telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    allowed_user_id: int = int(os.getenv("ALLOWED_USER_ID", "0"))
+
+    # Anthropic
+    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+    claude_model: str = "claude-sonnet-4-5-20250514"
+    max_tokens: int = 1024
+    token_budget: int = 8000       # max tokens for conversation history
+    max_messages: int = 50         # max messages to fetch for context
+    summary_threshold: int = 40    # trigger summary after N messages in 24h
+
+    # Supabase
+    supabase_url: str = os.getenv("SUPABASE_URL", "")
+    supabase_key: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+    # User defaults
+    user_timezone: str = os.getenv("USER_TIMEZONE", "Asia/Singapore")
+    user_name: str = "Kieran"
+    quiet_start: int = 23   # 11 PM
+    quiet_end: int = 7      # 7 AM
+    max_proactive_per_day: int = 5
+
+    # Serper.dev (optional — web search disabled if not set)
+    serper_api_key: str = os.getenv("SERPER_API_KEY", "")
+
+    # Dashboard Supabase (optional — separate DB for personal dashboard)
+    dashboard_supabase_url: str = os.getenv("DASHBOARD_SUPABASE_URL", "")
+    dashboard_supabase_key: str = os.getenv("DASHBOARD_SUPABASE_KEY", "")
+
+    # App
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+
+    def validate(self) -> None:
+        missing = []
+        if not self.telegram_token:
+            missing.append("TELEGRAM_BOT_TOKEN")
+        if not self.allowed_user_id:
+            missing.append("ALLOWED_USER_ID")
+        if not self.anthropic_api_key:
+            missing.append("ANTHROPIC_API_KEY")
+        if not self.supabase_url:
+            missing.append("SUPABASE_URL")
+        if not self.supabase_key:
+            missing.append("SUPABASE_SERVICE_KEY")
+        if missing:
+            raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+
+
+cfg = Config()
+
+PYEOF
+
+cat > src/utils/time_helpers.py << 'PYEOF'
+"""Timezone-aware helpers for Singapore time."""
+
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+from src.config import cfg
+
+_tz = ZoneInfo(cfg.user_timezone)
+
+
+def now_user() -> datetime:
+    """Current datetime in user's timezone."""
+    return datetime.now(_tz)
+
+
+def user_hour() -> int:
+    """Current hour (0-23) in user's timezone."""
+    return now_user().hour
+
+
+def is_quiet_hours() -> bool:
+    """True if inside quiet window (wraps around midnight)."""
+    h = user_hour()
+    if cfg.quiet_start > cfg.quiet_end:
+        return h >= cfg.quiet_start or h < cfg.quiet_end
+    return cfg.quiet_start <= h < cfg.quiet_end
+
+
+def format_user_time(dt: datetime | None = None) -> str:
+    """Human-readable time string in user's locale, including year."""
+    dt = dt or now_user()
+    return dt.strftime("%a %d %b %Y, %I:%M %p")
+
+
+def today_date_str() -> str:
+    """YYYY-MM-DD in user's timezone."""
+    return now_user().strftime("%Y-%m-%d")
+
+
+def time_of_day() -> str:
+    h = user_hour()
+    if h < 12:
+        return "morning"
+    if h < 17:
+        return "afternoon"
+    if h < 21:
+        return "evening"
+    return "night"
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate (≈4 chars/token)."""
+    return max(1, len(text) // 4)
+
+PYEOF
+
+cat > src/services/dashboard.py << 'PYEOF'
+"""Dashboard data service — reads from the separate personal dashboard Supabase.
+
+The dashboard uses a single flexible table:
+  dashboard_entries(id, category, data JSONB, created_at)
+
+This service is category-agnostic: it fetches whatever categories exist
+and lets Claude interpret the data. No code changes needed when new
+categories are added to the dashboard.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta
+
+from supabase import create_client, Client
+
+from src.config import cfg
+from src.utils.logger import log
+
+_client: Client | None = None
+
+
+def _get_dashboard_db() -> Client | None:
+    """Get dashboard Supabase client. Returns None if not configured."""
+    global _client
+    if not cfg.dashboard_supabase_url or not cfg.dashboard_supabase_key:
+        return None
+    if _client is None:
+        _client = create_client(cfg.dashboard_supabase_url, cfg.dashboard_supabase_key)
+    return _client
+
+
+def is_configured() -> bool:
+    """Check if dashboard DB credentials are set."""
+    return bool(cfg.dashboard_supabase_url and cfg.dashboard_supabase_key)
+
+
+def get_recent_entries(days: int = 7, limit: int = 100) -> list[dict]:
+    """Fetch recent dashboard entries across all categories."""
+    db = _get_dashboard_db()
+    if not db:
+        return []
+
+    try:
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        result = (
+            db.table("dashboard_entries")
+            .select("category, data, created_at")
+            .gte("created_at", since)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        log.error(f"Dashboard fetch error: {e}")
+        return []
+
+
+def get_latest_by_category(limit_per_category: int = 5) -> dict[str, list[dict]]:
+    """Fetch the latest entries grouped by category.
+
+    Returns: {"net_worth": [...], "spending": [...], "dating": [...], ...}
+    """
+    db = _get_dashboard_db()
+    if not db:
+        return {}
+
+    try:
+        # Fetch recent entries (last 30 days, generous window)
+        since = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        result = (
+            db.table("dashboard_entries")
+            .select("category, data, created_at")
+            .gte("created_at", since)
+            .order("created_at", desc=True)
+            .limit(200)
+            .execute()
+        )
+
+        grouped: dict[str, list[dict]] = {}
+        for row in result.data or []:
+            cat = row["category"]
+            if cat not in grouped:
+                grouped[cat] = []
+            if len(grouped[cat]) < limit_per_category:
+                grouped[cat].append({
+                    "data": row["data"],
+                    "created_at": row["created_at"],
+                })
+
+        return grouped
+    except Exception as e:
+        log.error(f"Dashboard grouped fetch error: {e}")
+        return {}
+
+
+def get_categories() -> list[str]:
+    """Get all distinct categories in the dashboard."""
+    db = _get_dashboard_db()
+    if not db:
+        return []
+
+    try:
+        result = (
+            db.table("dashboard_entries")
+            .select("category")
+            .execute()
+        )
+        return sorted(set(row["category"] for row in result.data or []))
+    except Exception as e:
+        log.error(f"Dashboard categories fetch error: {e}")
+        return []
+
+
+def format_for_context(grouped_data: dict[str, list[dict]]) -> str:
+    """Format grouped dashboard data into a string for Claude's context.
+
+    Deliberately category-agnostic — just dumps the structure and lets
+    Claude make sense of whatever categories and JSON shapes exist.
+    """
+    if not grouped_data:
+        return "No dashboard data available."
+
+    sections = []
+    for category, entries in grouped_data.items():
+        lines = [f"### {category} ({len(entries)} recent entries)"]
+        for entry in entries:
+            date_str = entry["created_at"][:10] if entry.get("created_at") else "?"
+            data = entry.get("data", {})
+            # Compact JSON for token efficiency
+            data_str = json.dumps(data, default=str, separators=(",", ":"))
+            # Truncate very large entries
+            if len(data_str) > 500:
+                data_str = data_str[:497] + "..."
+            lines.append(f"  [{date_str}] {data_str}")
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
+
+PYEOF
+
+cat > src/services/web_search.py << 'PYEOF'
+"""Web search via Serper.dev (Google Search API).
+
+Free tier: 2,500 queries.
+Setup: https://serper.dev → sign up → get API key → set SERPER_API_KEY in .env
+
+Falls back gracefully if not configured — Aria just won't be able to search.
+"""
+
+from __future__ import annotations
+
+import json
+import urllib.request
+
+from src.config import cfg
+from src.utils.logger import log
+
+_BASE = "https://google.serper.dev"
+
+
+def _post(endpoint: str, payload: dict) -> dict | None:
+    """Make a POST request to Serper API."""
+    if not cfg.serper_api_key:
+        log.debug("Serper not configured — skipping search")
+        return None
+
+    try:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{_BASE}/{endpoint}",
+            data=data,
+            headers={
+                "X-API-KEY": cfg.serper_api_key,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        log.error(f"Serper API error: {e}")
+        return None
+
+
+def search(query: str, num_results: int = 5) -> list[dict]:
+    """
+    Search Google via Serper.
+    Returns list of {"title", "snippet", "link"}.
+    """
+    data = _post("search", {
+        "q": query,
+        "num": min(num_results, 10),
+        "gl": "sg",
+    })
+
+    if not data:
+        return []
+
+    results = []
+    for item in data.get("organic", [])[:num_results]:
+        results.append({
+            "title": item.get("title", ""),
+            "snippet": item.get("snippet", ""),
+            "link": item.get("link", ""),
+        })
+
+    # Also grab knowledge graph if present
+    kg = data.get("knowledgeGraph")
+    if kg:
+        results.insert(0, {
+            "title": kg.get("title", ""),
+            "snippet": kg.get("description", ""),
+            "link": kg.get("website", kg.get("descriptionLink", "")),
+        })
+
+    log.info(f"Web search: '{query}' → {len(results)} results")
+    return results
+
+
+def search_images(query: str, num_results: int = 3) -> list[dict]:
+    """
+    Search Google Images via Serper.
+    Returns list of {"title", "image_url", "link"}.
+    """
+    data = _post("images", {
+        "q": query,
+        "num": min(num_results, 10),
+        "gl": "sg",
+    })
+
+    if not data:
+        return []
+
+    results = []
+    for item in data.get("images", [])[:num_results]:
+        results.append({
+            "title": item.get("title", ""),
+            "image_url": item.get("imageUrl", ""),
+            "link": item.get("link", ""),
+        })
+
+    log.info(f"Image search: '{query}' → {len(results)} results")
+    return results
+
+
+def format_results_for_context(results: list[dict], max_results: int = 5) -> str:
+    """Format search results into a string for Claude's context."""
+    if not results:
+        return "No search results found."
+
+    lines = []
+    for i, r in enumerate(results[:max_results], 1):
+        lines.append(f"{i}. {r['title']}\n   {r['snippet']}\n   {r['link']}")
+    return "\n\n".join(lines)
+
+PYEOF
+
 cat > src/services/claude_ai.py << 'PYEOF'
 """Claude API integration — Aria's brain.
 
@@ -25,6 +410,7 @@ from src.services.database import (
     save_memory,
 )
 from src.services import web_search
+from src.services import dashboard as dashboard_svc
 
 _client: anthropic.Anthropic | None = None
 
@@ -72,6 +458,15 @@ def _build_system_prompt(
     search_block = ""
     if search_results:
         search_block = f"\n## Web Search Results\n{search_results}"
+
+    dashboard_block = ""
+    if dashboard_svc.is_configured():
+        grouped = dashboard_svc.get_latest_by_category(limit_per_category=3)
+        if grouped:
+            dashboard_block = (
+                f"\n## {name}'s Dashboard Data (from his personal tracking system)\n"
+                + dashboard_svc.format_for_context(grouped)
+            )
 
     web_search_available = bool(cfg.serper_api_key)
 
@@ -148,6 +543,7 @@ Rules for reminders:
 {summary_block}
 {prefs_block}
 {search_block}
+{dashboard_block}
 
 ## Memory Extraction
 When {name} shares something important — a goal, preference, deadline, personal detail, or commitment — note it by including a <memory> tag at the END of your response (after your visible reply):
@@ -314,6 +710,14 @@ _TYPE_PROMPTS = {
         "Send {name} a brief, genuine affirmation or encouragement. "
         "Make it personal based on what you know about him, not generic positivity fluff."
     ),
+    "dashboard_insights": (
+        "Analyze {name}'s personal dashboard data below and send him a concise daily briefing. "
+        "Cover the most interesting or actionable insights across whatever categories are present. "
+        "Be specific with numbers and trends — don't be vague. Keep it punchy and Telegram-friendly. "
+        "If you spot something noteworthy (a spending spike, a goal milestone, a pattern), call it out. "
+        "Use your personality — make data feel personal, not like a spreadsheet.\n\n"
+        "Dashboard data:\n{dashboard_data}"
+    ),
     "custom": "{prompt}",
 }
 
@@ -363,6 +767,59 @@ def generate_proactive_message(
 
     except Exception as e:
         log.error(f"Failed to generate proactive message: {e}", exc_info=True)
+        return None
+
+
+def generate_dashboard_insights(user_id: int) -> str | None:
+    """Pull dashboard data and generate a daily insights message."""
+    if not dashboard_svc.is_configured():
+        log.debug("Dashboard not configured — skipping insights")
+        return None
+
+    try:
+        grouped = dashboard_svc.get_latest_by_category(limit_per_category=10)
+        if not grouped:
+            log.info("No dashboard data found for insights")
+            return None
+
+        dashboard_data = dashboard_svc.format_for_context(grouped)
+        memories = get_active_memories(user_id, 15)
+        name = cfg.user_name
+        current_time = format_user_time()
+
+        memory_block = (
+            "\n".join(f"- [{m['category']}] {m['content']}" for m in memories)
+            if memories else ""
+        )
+
+        template = _TYPE_PROMPTS["dashboard_insights"]
+        prompt = template.format(name=name, dashboard_data=dashboard_data)
+
+        system = (
+            f"You are Aria, {name}'s personal assistant. "
+            f"Current time: {current_time}.\n\n"
+            f"Your personality: warm, slightly flirty, competent, concise. "
+            f"You're messaging on Telegram so keep it punchy. "
+            f"Separate distinct thoughts with blank lines (each becomes a separate message).\n\n"
+            f"What you know about {name}:\n{memory_block}"
+        )
+
+        response = get_client().messages.create(
+            model=cfg.claude_model,
+            max_tokens=600,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        text = "".join(
+            block.text for block in response.content if block.type == "text"
+        )
+        clean = re.sub(r"<memory[^>]*>.*?</memory>", "", text, flags=re.DOTALL).strip()
+        log.info(f"Dashboard insights generated: {len(clean)} chars, {len(grouped)} categories")
+        return clean
+
+    except Exception as e:
+        log.error(f"Failed to generate dashboard insights: {e}", exc_info=True)
         return None
 
 
@@ -500,8 +957,533 @@ def _attach_reminder_confirmations(text: str, reminders: list[dict]) -> str:
 
 PYEOF
 
-echo "✅ Done. Now:"
-echo "  1. Run in Supabase SQL Editor:"
-echo "     DELETE FROM conversations;"
-echo "     DELETE FROM conversation_summaries;"
-echo "  2. git add -A && git commit -m 'Fix stale time context' && git push"
+cat > src/services/scheduler.py << 'PYEOF'
+"""Proactive messaging scheduler — cron-based check-ins and follow-ups.
+
+Uses APScheduler to trigger morning/evening check-ins and task follow-ups,
+plus a periodic sweep for DB-scheduled messages.
+"""
+
+from __future__ import annotations
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+
+from src.config import cfg
+from src.utils.logger import log
+from src.utils.time_helpers import is_quiet_hours
+from src.services.claude_ai import generate_proactive_message, generate_dashboard_insights
+from src.services.database import (
+    get_pending_scheduled_messages,
+    mark_scheduled_sent,
+    log_proactive_message,
+    get_daily_proactive_count,
+    get_memories_by_category,
+)
+
+_bot_app = None  # Will hold the telegram Application for sending
+_scheduler: AsyncIOScheduler | None = None
+
+
+def init_scheduler(bot_app) -> AsyncIOScheduler:
+    """Set up cron jobs and return the scheduler."""
+    global _bot_app, _scheduler
+    _bot_app = bot_app
+    _scheduler = AsyncIOScheduler()
+    user_id = cfg.allowed_user_id
+    tz = cfg.user_timezone
+
+    # Morning check-in at 7:30 AM user time
+    _scheduler.add_job(
+        _send_proactive,
+        CronTrigger(hour=7, minute=30, timezone=tz),
+        args=[user_id, "morning_checkin"],
+        id="morning_checkin",
+        replace_existing=True,
+    )
+
+    # Evening check-in at 9:00 PM user time
+    _scheduler.add_job(
+        _send_proactive,
+        CronTrigger(hour=21, minute=0, timezone=tz),
+        args=[user_id, "evening_checkin"],
+        id="evening_checkin",
+        replace_existing=True,
+    )
+
+    # Task follow-up at 2:00 PM weekdays
+    _scheduler.add_job(
+        _send_task_followup,
+        CronTrigger(hour=14, minute=0, day_of_week="mon-fri", timezone=tz),
+        args=[user_id],
+        id="task_followup",
+        replace_existing=True,
+    )
+
+    # Daily dashboard insights at 8:00 AM
+    _scheduler.add_job(
+        _send_dashboard_insights,
+        CronTrigger(hour=8, minute=0, timezone=tz),
+        args=[user_id],
+        id="dashboard_insights",
+        replace_existing=True,
+    )
+
+    # Process DB-scheduled messages every 5 minutes
+    _scheduler.add_job(
+        _process_scheduled_messages,
+        "interval",
+        minutes=5,
+        id="process_scheduled",
+        replace_existing=True,
+    )
+
+    _scheduler.start()
+    log.info("Proactive scheduler initialized with cron jobs")
+    return _scheduler
+
+
+# ─── Core Send Logic ────────────────────────────────────────
+
+
+async def _send_proactive(user_id: int, msg_type: str, context: dict | None = None) -> None:
+    """Generate and send a proactive message with safety checks."""
+    try:
+        if is_quiet_hours():
+            log.info(f"Skipping proactive [{msg_type}] — quiet hours")
+            return
+
+        daily_count = get_daily_proactive_count(user_id)
+        if daily_count >= cfg.max_proactive_per_day:
+            log.info(f"Skipping proactive [{msg_type}] — daily limit ({daily_count})")
+            return
+
+        message = generate_proactive_message(user_id, msg_type, context)
+        if not message:
+            log.warning(f"No message generated for [{msg_type}]")
+            return
+
+        # Send via Telegram
+        try:
+            await _bot_app.bot.send_message(
+                chat_id=user_id, text=message, parse_mode="Markdown"
+            )
+        except Exception:
+            # Retry without markdown if formatting fails
+            await _bot_app.bot.send_message(chat_id=user_id, text=message)
+
+        log_proactive_message(user_id, msg_type)
+        log.info(f"Proactive [{msg_type}] sent: {message[:60]}...")
+
+    except Exception as e:
+        log.error(f"Failed to send proactive [{msg_type}]: {e}", exc_info=True)
+
+
+# ─── Task Follow-up ─────────────────────────────────────────
+
+
+async def _send_task_followup(user_id: int) -> None:
+    """Pick the highest-priority task/goal and follow up."""
+    try:
+        tasks = get_memories_by_category(user_id, "task")
+        goals = get_memories_by_category(user_id, "goal")
+        items = sorted(tasks + goals, key=lambda x: x.get("importance", 0), reverse=True)
+
+        if not items:
+            log.info("No tasks/goals to follow up on")
+            return
+
+        item = items[0]
+        await _send_proactive(user_id, "task_followup", {"task": item["content"]})
+
+    except Exception as e:
+        log.error(f"Task follow-up error: {e}", exc_info=True)
+
+
+# ─── Dashboard Insights ─────────────────────────────────────
+
+
+async def _send_dashboard_insights(user_id: int) -> None:
+    """Generate and send daily dashboard insights."""
+    try:
+        if is_quiet_hours():
+            log.info("Skipping dashboard insights — quiet hours")
+            return
+
+        daily_count = get_daily_proactive_count(user_id)
+        if daily_count >= cfg.max_proactive_per_day:
+            log.info("Skipping dashboard insights — daily limit")
+            return
+
+        message = generate_dashboard_insights(user_id)
+        if not message:
+            log.info("No dashboard insights generated (not configured or no data)")
+            return
+
+        # Split on double newlines for multi-message feel
+        import asyncio
+        import re
+        chunks = [c.strip() for c in re.split(r"\n\n+", message) if c.strip()]
+
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                await asyncio.sleep(0.5)
+            try:
+                await _bot_app.bot.send_message(
+                    chat_id=user_id, text=chunk, parse_mode="Markdown"
+                )
+            except Exception:
+                await _bot_app.bot.send_message(chat_id=user_id, text=chunk)
+
+        log_proactive_message(user_id, "dashboard_insights")
+        log.info(f"Dashboard insights sent: {len(chunks)} messages")
+
+    except Exception as e:
+        log.error(f"Dashboard insights error: {e}", exc_info=True)
+
+
+# ─── DB-Scheduled Messages ──────────────────────────────────
+
+
+async def _process_scheduled_messages() -> None:
+    """Sweep for pending scheduled messages and send them."""
+    try:
+        pending = get_pending_scheduled_messages()
+        if not pending:
+            return
+
+        log.info(f"Processing {len(pending)} scheduled messages")
+
+        for item in pending:
+            uid = item["user_id"]
+
+            if is_quiet_hours():
+                log.info(f"Skipping scheduled {item['id']} — quiet hours")
+                continue
+
+            daily = get_daily_proactive_count(uid)
+            if daily >= cfg.max_proactive_per_day:
+                log.info(f"Skipping scheduled {item['id']} — daily limit")
+                continue
+
+            message = item.get("content")
+            if not message:
+                message = generate_proactive_message(
+                    uid, item["type"], item.get("context", {})
+                )
+
+            if message:
+                try:
+                    await _bot_app.bot.send_message(
+                        chat_id=uid, text=message, parse_mode="Markdown"
+                    )
+                except Exception:
+                    await _bot_app.bot.send_message(chat_id=uid, text=message)
+                log_proactive_message(uid, item["type"])
+
+            mark_scheduled_sent(item["id"])
+            log.info(f"Scheduled {item['id']} [{item['type']}] processed")
+
+    except Exception as e:
+        log.error(f"Error processing scheduled messages: {e}", exc_info=True)
+
+
+# ─── Reminder Scheduling ────────────────────────────────────
+
+
+def schedule_reminder(user_id: int, dt, message: str) -> bool:
+    """Schedule a one-time reminder at a specific datetime.
+
+    Args:
+        user_id: Telegram user ID to send to
+        dt: datetime object (timezone-aware) for when to fire
+        message: The reminder text to send
+    Returns:
+        True if scheduled successfully
+    """
+    if _scheduler is None:
+        log.error("Scheduler not initialized — can't schedule reminder")
+        return False
+
+    job_id = f"reminder_{user_id}_{dt.timestamp()}"
+
+    _scheduler.add_job(
+        _send_reminder,
+        DateTrigger(run_date=dt),
+        args=[user_id, message],
+        id=job_id,
+        replace_existing=True,
+    )
+
+    log.info(f"Reminder scheduled: '{message[:50]}' at {dt.isoformat()}")
+    return True
+
+
+async def _send_reminder(user_id: int, message: str) -> None:
+    """Send a reminder message to the user."""
+    try:
+        if _bot_app is None:
+            log.error("Bot app not available for reminder")
+            return
+
+        reminder_text = f"⏰ *Reminder*\n\n{message}"
+
+        try:
+            await _bot_app.bot.send_message(
+                chat_id=user_id, text=reminder_text, parse_mode="Markdown"
+            )
+        except Exception:
+            await _bot_app.bot.send_message(chat_id=user_id, text=f"⏰ Reminder\n\n{message}")
+
+        log.info(f"Reminder sent to {user_id}: {message[:60]}")
+
+    except Exception as e:
+        log.error(f"Failed to send reminder: {e}", exc_info=True)
+
+PYEOF
+
+cat > src/handlers/telegram_handlers.py << 'PYEOF'
+"""Telegram message handlers — routing, auth, response flow."""
+
+from __future__ import annotations
+
+import asyncio
+import re
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from src.config import cfg
+from src.utils.logger import log
+from src.services.database import ensure_user, save_message, get_active_memories
+from src.services.claude_ai import generate_response, parse_images, get_pending_reminders
+from src.services.summarizer import maybe_summarize
+from src.services.scheduler import schedule_reminder
+
+
+def register_handlers(app: Application) -> None:
+    """Attach all handlers to the Telegram Application."""
+    app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("memories", _cmd_memories))
+    app.add_handler(CommandHandler("clear", _cmd_clear))
+    app.add_handler(CommandHandler("help", _cmd_help))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message)
+    )
+    log.info("Telegram handlers registered")
+
+
+# ─── Auth Guard ──────────────────────────────────────────────
+
+
+def _is_authorized(update: Update) -> bool:
+    """Only allow the configured user."""
+    return update.effective_user and update.effective_user.id == cfg.allowed_user_id
+
+
+# ─── Command Handlers ───────────────────────────────────────
+
+
+async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await update.message.reply_text("Sorry, I'm a personal assistant — not taking new clients 😉")
+        return
+
+    ensure_user(update.effective_user)
+    name = cfg.user_name
+
+    await update.message.reply_text(
+        f"Hey {name} 👋\n\n"
+        f"I'm Aria, your personal assistant. I'm here to help you stay on top of "
+        f"things, remember what matters, and maybe make your day a little better.\n\n"
+        f"Just talk to me like you would a friend. I'll remember our conversations "
+        f"and check in on you from time to time.\n\n"
+        f"Type /help to see what I can do."
+    )
+
+
+async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
+
+    await update.message.reply_text(
+        "*Commands:*\n"
+        "/start — Introduction\n"
+        "/memories — What I remember about you\n"
+        "/clear — Clear conversation (keeps memories)\n"
+        "/help — This message\n\n"
+        "Or just talk to me naturally — I handle tasks, reminders, goals, "
+        "and everything in between ✨",
+        parse_mode="Markdown",
+    )
+
+
+async def _cmd_memories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
+
+    user_id = update.effective_user.id
+    memories = get_active_memories(user_id, limit=20)
+
+    if not memories:
+        await update.message.reply_text(
+            "I don't have any stored memories yet — we're just getting started! "
+            "The more we talk, the more I'll remember about what matters to you."
+        )
+        return
+
+    grouped: dict[str, list[str]] = {}
+    for m in memories:
+        cat = m["category"]
+        grouped.setdefault(cat, []).append(m["content"])
+
+    lines = ["*Here's what I remember about you:*\n"]
+    for cat, items in grouped.items():
+        emoji = {
+            "personal": "👤", "preference": "⭐", "goal": "🎯",
+            "task": "📋", "relationship": "💛", "habit": "🔄",
+            "work": "💻", "health": "🏃", "interest": "🎮", "other": "📝",
+        }.get(cat, "📝")
+        lines.append(f"\n{emoji} *{cat.title()}*")
+        for item in items:
+            lines.append(f"  • {item}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def _cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        return
+
+    await update.message.reply_text(
+        "Conversation context refreshed. Your memories are still intact — "
+        "I haven't forgotten anything important 😊"
+    )
+
+
+# ─── Main Message Handler ───────────────────────────────────
+
+
+async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process incoming text messages."""
+    if not _is_authorized(update):
+        await update.message.reply_text("I'm spoken for 😏")
+        return
+
+    user = update.effective_user
+    user_id = user.id
+    text = update.message.text.strip()
+
+    if not text:
+        return
+
+    log.info(f"Message from {user.first_name}: {text[:80]}...")
+
+    # Ensure user exists
+    ensure_user(user)
+
+    # Save user message
+    save_message(user_id, "user", text, metadata={
+        "message_id": update.message.message_id,
+        "chat_id": update.effective_chat.id,
+    })
+
+    # Show typing indicator
+    await update.effective_chat.send_action("typing")
+
+    # Generate response
+    response_text = generate_response(user_id, text)
+
+    # Save full assistant response
+    save_message(user_id, "assistant", response_text)
+
+    # Schedule any reminders that were parsed
+    reminders = get_pending_reminders()
+    for reminder in reminders:
+        schedule_reminder(user_id, reminder["dt"], reminder["message"])
+
+    # Extract images, then split into message chunks
+    text_without_images, images = parse_images(response_text)
+    await _send_split_response(update, text_without_images, images)
+
+    # Background: check if we need to summarize
+    await maybe_summarize(user_id)
+
+
+# ─── Multi-Message Sender ───────────────────────────────────
+
+
+async def _send_split_response(
+    update: Update,
+    text: str,
+    images: list[dict] | None = None,
+) -> None:
+    """Split response on double newlines and send as separate Telegram messages.
+    Images are sent at the end (or inline if we can match position later)."""
+    chat = update.effective_chat
+
+    # Split on double newlines (blank lines) — each chunk becomes a message
+    chunks = [c.strip() for c in re.split(r"\n\n+", text) if c.strip()]
+
+    if not chunks and not images:
+        return
+
+    for i, chunk in enumerate(chunks):
+        # Small delay between messages for natural feel (skip first)
+        if i > 0:
+            await asyncio.sleep(0.4)
+            await chat.send_action("typing")
+            await asyncio.sleep(0.3)
+
+        try:
+            await chat.send_message(chunk, parse_mode="Markdown")
+        except Exception:
+            try:
+                await chat.send_message(chunk)
+            except Exception as e:
+                log.error(f"Failed to send chunk {i}: {e}")
+
+    # Send any images
+    for img in (images or []):
+        try:
+            await asyncio.sleep(0.3)
+            await chat.send_photo(
+                photo=img["url"],
+                caption=img.get("caption"),
+            )
+        except Exception as e:
+            log.error(f"Failed to send image {img['url']}: {e}")
+            # If image fails, send the caption as text fallback
+            if img.get("caption"):
+                try:
+                    await chat.send_message(f"📷 {img['caption']}")
+                except Exception:
+                    pass
+
+PYEOF
+
+
+echo ""
+echo "✅ Patch applied!"
+echo ""
+echo "Files updated/added:"
+echo "  src/config.py                (dashboard DB creds, bumped proactive limit)"
+echo "  src/utils/time_helpers.py    (year in timestamps)"
+echo "  src/services/dashboard.py    (NEW — dashboard data service)"
+echo "  src/services/web_search.py   (Serper.dev)"
+echo "  src/services/claude_ai.py    (dashboard context + insights generation)"
+echo "  src/services/scheduler.py    (8 AM daily insights cron job)"
+echo "  src/handlers/telegram_handlers.py"
+echo ""
+echo "Add to .env and Render:"
+echo "  DASHBOARD_SUPABASE_URL=https://your-dashboard-project.supabase.co"
+echo "  DASHBOARD_SUPABASE_KEY=your_dashboard_service_role_key"
+echo ""
+echo "Then: git add -A && git commit -m 'Add dashboard insights' && git push"
