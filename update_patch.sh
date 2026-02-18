@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-echo "🔧 Patching Aria Bot — Dashboard Insights..."
+echo "🔧 Patching Aria Bot — Vision + Temporal Awareness..."
 
 cat > src/config.py << 'PYEOF'
 """Central configuration — reads env vars once, validates, exports."""
@@ -21,7 +21,7 @@ class Config:
 
     # Anthropic
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
-    claude_model: str = "claude-sonnet-4-5-20250514"
+    claude_model: str = "claude-sonnet-4-5-20250929"
     max_tokens: int = 1024
     token_budget: int = 8000       # max tokens for conversation history
     max_messages: int = 50         # max messages to fetch for context
@@ -436,11 +436,15 @@ def _build_system_prompt(
     today_str = now_user().strftime("%Y-%m-%d")
     name = cfg.user_name
 
-    memory_block = (
-        "\n".join(f"- [{m['category']}] {m['content']}" for m in memories)
-        if memories
-        else "No stored memories yet — getting to know him."
-    )
+    memory_block = ""
+    if memories:
+        mem_lines = []
+        for m in memories:
+            ts = m.get("created_at", "")[:16].replace("T", " ") if m.get("created_at") else ""
+            mem_lines.append(f"- [{m['category']}] ({ts}) {m['content']}")
+        memory_block = "\n".join(mem_lines)
+    else:
+        memory_block = "No stored memories yet — getting to know him."
 
     summary_block = ""
     if summaries:
@@ -552,6 +556,15 @@ When {name} shares something important — a goal, preference, deadline, persona
 Categories: personal, preference, goal, task, relationship, habit, work, health, interest, other
 Only extract genuinely useful info, not casual chit-chat. Multiple tags OK if needed.
 
+IMPORTANT — Time-aware memories:
+- When {name} mentions something with a time context (e.g. "I'm sleeping at 2am", "I have a meeting tomorrow at 3pm", "I went to the gym yesterday"), ALWAYS include the actual date/time in the memory content itself.
+- Use the current time ({current_time}, date: {today_str}) to calculate absolute dates. For example:
+  - "{name} says 'I slept at 2am last night'" → memory: "{name} slept at 2am on {today_str}" (or yesterday's date if it's morning)
+  - "{name} says 'meeting tomorrow at 3pm'" → memory: "Meeting scheduled for [tomorrow's date] at 3pm"
+- Each memory has a timestamp showing when it was recorded. Use this to understand the timeline:
+  - A memory timestamped 2 days ago saying "going to gym tomorrow" means he went to the gym 1 day ago
+  - Reference past events naturally: "that was yesterday", "a few days ago", "last week" — not by raw dates
+
 ## Rules
 - Never break character. You ARE Aria, not "an AI assistant"
 - Don't mention being an AI, having limitations, or not having feelings
@@ -564,8 +577,13 @@ Only extract genuinely useful info, not casual chit-chat. Multiple tags OK if ne
 # ─── Response Generation ────────────────────────────────────
 
 
-def generate_response(user_id: int, user_message: str) -> str:
-    """Generate Aria's response with search and reminder support.
+def generate_response(user_id: int, user_message: str, image_data: dict | None = None) -> str:
+    """Generate Aria's response with search, reminder, and vision support.
+
+    Args:
+        user_id: Telegram user ID
+        user_message: Text content of the message
+        image_data: Optional dict with {"base64": str, "media_type": str} for image vision
 
     Flow:
     1. First pass: ask Claude to respond (may include <search> tags)
@@ -578,10 +596,29 @@ def generate_response(user_id: int, user_message: str) -> str:
         history = get_recent_conversation(user_id)
 
         system = _build_system_prompt(memories, summaries)
-        messages = history + [{"role": "user", "content": user_message}]
+
+        # Build the user message content (text + optional image)
+        if image_data:
+            user_content = []
+            user_content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image_data["media_type"],
+                    "data": image_data["base64"],
+                },
+            })
+            if user_message:
+                user_content.append({"type": "text", "text": user_message})
+            else:
+                user_content.append({"type": "text", "text": "What do you see in this image?"})
+            messages = history + [{"role": "user", "content": user_content}]
+        else:
+            messages = history + [{"role": "user", "content": user_message}]
 
         log.info(
-            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories, time={format_user_time()}"
+            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories, "
+            f"time={format_user_time()}, has_image={image_data is not None}"
         )
 
         response = get_client().messages.create(
@@ -1249,6 +1286,7 @@ cat > src/handlers/telegram_handlers.py << 'PYEOF'
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 
 from telegram import Update
@@ -1276,6 +1314,9 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message)
+    )
+    app.add_handler(
+        MessageHandler(filters.PHOTO, _handle_photo)
     )
     log.info("Telegram handlers registered")
 
@@ -1417,6 +1458,65 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await maybe_summarize(user_id)
 
 
+# ─── Photo Handler ───────────────────────────────────────────
+
+
+async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process incoming photos — download, encode, send to Claude for vision."""
+    if not _is_authorized(update):
+        await update.message.reply_text("I'm spoken for 😏")
+        return
+
+    user = update.effective_user
+    user_id = user.id
+    caption = update.message.caption or ""
+
+    log.info(f"Photo from {user.first_name}: caption='{caption[:60]}...'")
+
+    ensure_user(user)
+
+    # Get the highest resolution photo
+    photo = update.message.photo[-1]  # last = largest
+    photo_file = await photo.get_file()
+
+    # Download to bytes
+    photo_bytes = await photo_file.download_as_bytearray()
+    b64_data = base64.b64encode(bytes(photo_bytes)).decode("utf-8")
+
+    # Determine media type (Telegram photos are always JPEG)
+    media_type = "image/jpeg"
+
+    log.info(f"Photo downloaded: {len(photo_bytes)} bytes, sending to Claude")
+
+    # Save user message (text description of the image)
+    save_message(user_id, "user", f"[Sent a photo] {caption}".strip(), metadata={
+        "message_id": update.message.message_id,
+        "chat_id": update.effective_chat.id,
+        "has_image": True,
+    })
+
+    # Show typing
+    await update.effective_chat.send_action("typing")
+
+    # Generate response with vision
+    image_data = {"base64": b64_data, "media_type": media_type}
+    response_text = generate_response(user_id, caption, image_data=image_data)
+
+    # Save response
+    save_message(user_id, "assistant", response_text)
+
+    # Schedule reminders
+    reminders = get_pending_reminders()
+    for reminder in reminders:
+        schedule_reminder(user_id, reminder["dt"], reminder["message"])
+
+    # Send split response
+    text_without_images, images = parse_images(response_text)
+    await _send_split_response(update, text_without_images, images)
+
+    await maybe_summarize(user_id)
+
+
 # ─── Multi-Message Sender ───────────────────────────────────
 
 
@@ -1473,17 +1573,10 @@ PYEOF
 echo ""
 echo "✅ Patch applied!"
 echo ""
-echo "Files updated/added:"
-echo "  src/config.py                (dashboard DB creds, bumped proactive limit)"
-echo "  src/utils/time_helpers.py    (year in timestamps)"
-echo "  src/services/dashboard.py    (NEW — dashboard data service)"
-echo "  src/services/web_search.py   (Serper.dev)"
-echo "  src/services/claude_ai.py    (dashboard context + insights generation)"
-echo "  src/services/scheduler.py    (8 AM daily insights cron job)"
-echo "  src/handlers/telegram_handlers.py"
+echo "New features:"
+echo "  📷 Image processing — send Aria photos, she can see and respond"
+echo "  🕐 Temporal awareness — memories now include timestamps"
+echo "     Aria knows 'when' things happened and references them naturally"
+echo "  📊 Dashboard insights (from previous patch)"
 echo ""
-echo "Add to .env and Render:"
-echo "  DASHBOARD_SUPABASE_URL=https://your-dashboard-project.supabase.co"
-echo "  DASHBOARD_SUPABASE_KEY=your_dashboard_service_role_key"
-echo ""
-echo "Then: git add -A && git commit -m 'Add dashboard insights' && git push"
+echo "Then: git add -A && git commit -m 'Add vision + temporal awareness' && git push"

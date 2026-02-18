@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 
 from telegram import Update
@@ -30,6 +31,9 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message)
+    )
+    app.add_handler(
+        MessageHandler(filters.PHOTO, _handle_photo)
     )
     log.info("Telegram handlers registered")
 
@@ -168,6 +172,65 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _send_split_response(update, text_without_images, images)
 
     # Background: check if we need to summarize
+    await maybe_summarize(user_id)
+
+
+# ─── Photo Handler ───────────────────────────────────────────
+
+
+async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process incoming photos — download, encode, send to Claude for vision."""
+    if not _is_authorized(update):
+        await update.message.reply_text("I'm spoken for 😏")
+        return
+
+    user = update.effective_user
+    user_id = user.id
+    caption = update.message.caption or ""
+
+    log.info(f"Photo from {user.first_name}: caption='{caption[:60]}...'")
+
+    ensure_user(user)
+
+    # Get the highest resolution photo
+    photo = update.message.photo[-1]  # last = largest
+    photo_file = await photo.get_file()
+
+    # Download to bytes
+    photo_bytes = await photo_file.download_as_bytearray()
+    b64_data = base64.b64encode(bytes(photo_bytes)).decode("utf-8")
+
+    # Determine media type (Telegram photos are always JPEG)
+    media_type = "image/jpeg"
+
+    log.info(f"Photo downloaded: {len(photo_bytes)} bytes, sending to Claude")
+
+    # Save user message (text description of the image)
+    save_message(user_id, "user", f"[Sent a photo] {caption}".strip(), metadata={
+        "message_id": update.message.message_id,
+        "chat_id": update.effective_chat.id,
+        "has_image": True,
+    })
+
+    # Show typing
+    await update.effective_chat.send_action("typing")
+
+    # Generate response with vision
+    image_data = {"base64": b64_data, "media_type": media_type}
+    response_text = generate_response(user_id, caption, image_data=image_data)
+
+    # Save response
+    save_message(user_id, "assistant", response_text)
+
+    # Schedule reminders
+    reminders = get_pending_reminders()
+    for reminder in reminders:
+        schedule_reminder(user_id, reminder["dt"], reminder["message"])
+
+    # Send split response
+    text_without_images, images = parse_images(response_text)
+    await _send_split_response(update, text_without_images, images)
+
     await maybe_summarize(user_id)
 
 

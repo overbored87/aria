@@ -47,11 +47,15 @@ def _build_system_prompt(
     today_str = now_user().strftime("%Y-%m-%d")
     name = cfg.user_name
 
-    memory_block = (
-        "\n".join(f"- [{m['category']}] {m['content']}" for m in memories)
-        if memories
-        else "No stored memories yet — getting to know him."
-    )
+    memory_block = ""
+    if memories:
+        mem_lines = []
+        for m in memories:
+            ts = m.get("created_at", "")[:16].replace("T", " ") if m.get("created_at") else ""
+            mem_lines.append(f"- [{m['category']}] ({ts}) {m['content']}")
+        memory_block = "\n".join(mem_lines)
+    else:
+        memory_block = "No stored memories yet — getting to know him."
 
     summary_block = ""
     if summaries:
@@ -163,6 +167,15 @@ When {name} shares something important — a goal, preference, deadline, persona
 Categories: personal, preference, goal, task, relationship, habit, work, health, interest, other
 Only extract genuinely useful info, not casual chit-chat. Multiple tags OK if needed.
 
+IMPORTANT — Time-aware memories:
+- When {name} mentions something with a time context (e.g. "I'm sleeping at 2am", "I have a meeting tomorrow at 3pm", "I went to the gym yesterday"), ALWAYS include the actual date/time in the memory content itself.
+- Use the current time ({current_time}, date: {today_str}) to calculate absolute dates. For example:
+  - "{name} says 'I slept at 2am last night'" → memory: "{name} slept at 2am on {today_str}" (or yesterday's date if it's morning)
+  - "{name} says 'meeting tomorrow at 3pm'" → memory: "Meeting scheduled for [tomorrow's date] at 3pm"
+- Each memory has a timestamp showing when it was recorded. Use this to understand the timeline:
+  - A memory timestamped 2 days ago saying "going to gym tomorrow" means he went to the gym 1 day ago
+  - Reference past events naturally: "that was yesterday", "a few days ago", "last week" — not by raw dates
+
 ## Rules
 - Never break character. You ARE Aria, not "an AI assistant"
 - Don't mention being an AI, having limitations, or not having feelings
@@ -175,8 +188,13 @@ Only extract genuinely useful info, not casual chit-chat. Multiple tags OK if ne
 # ─── Response Generation ────────────────────────────────────
 
 
-def generate_response(user_id: int, user_message: str) -> str:
-    """Generate Aria's response with search and reminder support.
+def generate_response(user_id: int, user_message: str, image_data: dict | None = None) -> str:
+    """Generate Aria's response with search, reminder, and vision support.
+
+    Args:
+        user_id: Telegram user ID
+        user_message: Text content of the message
+        image_data: Optional dict with {"base64": str, "media_type": str} for image vision
 
     Flow:
     1. First pass: ask Claude to respond (may include <search> tags)
@@ -189,10 +207,29 @@ def generate_response(user_id: int, user_message: str) -> str:
         history = get_recent_conversation(user_id)
 
         system = _build_system_prompt(memories, summaries)
-        messages = history + [{"role": "user", "content": user_message}]
+
+        # Build the user message content (text + optional image)
+        if image_data:
+            user_content = []
+            user_content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image_data["media_type"],
+                    "data": image_data["base64"],
+                },
+            })
+            if user_message:
+                user_content.append({"type": "text", "text": user_message})
+            else:
+                user_content.append({"type": "text", "text": "What do you see in this image?"})
+            messages = history + [{"role": "user", "content": user_content}]
+        else:
+            messages = history + [{"role": "user", "content": user_message}]
 
         log.info(
-            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories, time={format_user_time()}"
+            f"Calling Claude: {len(history)} history msgs, {len(memories)} memories, "
+            f"time={format_user_time()}, has_image={image_data is not None}"
         )
 
         response = get_client().messages.create(
