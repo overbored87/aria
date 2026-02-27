@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.date import DateTrigger
 
 from src.config import cfg
 from src.utils.logger import log
@@ -20,6 +19,12 @@ from src.services.database import (
     log_proactive_message,
     get_daily_proactive_count,
     get_memories_by_category,
+    save_reminder,
+    get_due_reminders,
+    get_nudgeable_reminders,
+    mark_reminder_active,
+    increment_nudge,
+    mark_reminder_done,
 )
 
 _bot_app = None  # Will hold the telegram Application for sending
@@ -76,6 +81,15 @@ def init_scheduler(bot_app) -> AsyncIOScheduler:
         "interval",
         minutes=5,
         id="process_scheduled",
+        replace_existing=True,
+    )
+
+    # Process reminders every 60 seconds for near-realtime delivery
+    _scheduler.add_job(
+        _process_due_reminders,
+        "interval",
+        seconds=60,
+        id="process_reminders",
         replace_existing=True,
     )
 
@@ -233,35 +247,86 @@ async def _process_scheduled_messages() -> None:
 
 
 def schedule_reminder(user_id: int, dt, message: str) -> bool:
-    """Schedule a one-time reminder at a specific datetime.
+    """Save a reminder to the database for persistent scheduling.
 
     Args:
         user_id: Telegram user ID to send to
         dt: datetime object (timezone-aware) for when to fire
         message: The reminder text to send
     Returns:
-        True if scheduled successfully
+        True if saved successfully
     """
-    if _scheduler is None:
-        log.error("Scheduler not initialized — can't schedule reminder")
+    try:
+        result = save_reminder(user_id, message, dt.isoformat())
+        if result:
+            log.info(f"Reminder persisted: '{message[:50]}' at {dt.isoformat()}")
+            return True
+        return False
+    except Exception as e:
+        log.error(f"Failed to save reminder: {e}")
         return False
 
-    job_id = f"reminder_{user_id}_{dt.timestamp()}"
 
-    _scheduler.add_job(
-        _send_reminder,
-        DateTrigger(run_date=dt),
-        args=[user_id, message],
-        id=job_id,
-        replace_existing=True,
-    )
+async def _process_due_reminders() -> None:
+    """Sweep for due reminders and active reminders needing nudges. Runs every 60 seconds."""
+    try:
+        # 1. First-time sends: pending reminders that are now due
+        due = get_due_reminders()
+        for reminder in due:
+            uid = reminder["user_id"]
+            message = reminder["message"]
 
-    log.info(f"Reminder scheduled: '{message[:50]}' at {dt.isoformat()}")
-    return True
+            if is_quiet_hours():
+                continue
+
+            try:
+                reminder_text = f"⏰ *Reminder*\n\n{message}"
+                try:
+                    await _bot_app.bot.send_message(
+                        chat_id=uid, text=reminder_text, parse_mode="Markdown"
+                    )
+                except Exception:
+                    await _bot_app.bot.send_message(
+                        chat_id=uid, text=f"⏰ Reminder\n\n{message}"
+                    )
+                log.info(f"Reminder first send to {uid}: {message[:60]}")
+            except Exception as e:
+                log.error(f"Failed to send reminder {reminder['id']}: {e}")
+
+            mark_reminder_active(reminder["id"])
+
+        # 2. Nudges: active reminders not acknowledged, last nudged >= 30 min ago
+        nudgeable = get_nudgeable_reminders()
+        for reminder in nudgeable:
+            uid = reminder["user_id"]
+            message = reminder["message"]
+            count = reminder.get("nudge_count", 1)
+
+            if is_quiet_hours():
+                continue
+
+            try:
+                nudge_text = f"⏰ *Gentle nudge #{count}*\n\n{message}\n\n_Reply when done, or ask me to reschedule/cancel_"
+                try:
+                    await _bot_app.bot.send_message(
+                        chat_id=uid, text=nudge_text, parse_mode="Markdown"
+                    )
+                except Exception:
+                    await _bot_app.bot.send_message(
+                        chat_id=uid, text=f"⏰ Nudge #{count}\n\n{message}\n\nReply when done, or ask me to reschedule/cancel"
+                    )
+                log.info(f"Reminder nudge #{count} to {uid}: {message[:60]}")
+            except Exception as e:
+                log.error(f"Failed to nudge reminder {reminder['id']}: {e}")
+
+            increment_nudge(reminder["id"])
+
+    except Exception as e:
+        log.error(f"Error processing reminders: {e}", exc_info=True)
 
 
 async def _send_reminder(user_id: int, message: str) -> None:
-    """Send a reminder message to the user."""
+    """Send a reminder message to the user (legacy — kept for any in-flight APScheduler jobs)."""
     try:
         if _bot_app is None:
             log.error("Bot app not available for reminder")

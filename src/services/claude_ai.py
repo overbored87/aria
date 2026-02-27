@@ -19,6 +19,10 @@ from src.services.database import (
     get_active_memories,
     get_recent_summaries,
     save_memory,
+    deactivate_memories_matching,
+    complete_reminders_matching,
+    cancel_reminders_matching,
+    get_upcoming_reminders,
 )
 from src.services import web_search
 from src.services import dashboard as dashboard_svc
@@ -83,9 +87,34 @@ def _build_system_prompt(
                 + dashboard_svc.format_for_context(grouped)
             )
 
+    # Upcoming reminders (3-day horizon)
+    reminders_block = ""
+    try:
+        upcoming = get_upcoming_reminders(cfg.allowed_user_id, horizon_days=3)
+        if upcoming:
+            rem_lines = []
+            for r in upcoming:
+                status_emoji = "🔔" if r["status"] == "active" else "⏳"
+                nudges = f" (nudged {r['nudge_count']}x)" if r.get("nudge_count", 0) > 0 else ""
+                rem_lines.append(f"  {status_emoji} {r['trigger_at'][:16]} — {r['message']}{nudges}")
+            reminders_block = f"\n## Active/Upcoming Reminders (next 3 days)\n" + "\n".join(rem_lines)
+    except Exception:
+        pass
+
     web_search_available = bool(cfg.serper_api_key)
 
-    return f"""You are Aria, {name}'s personal AI assistant on Telegram.
+    now = now_user()
+    day_name = now.strftime("%A")  # "Saturday"
+    is_weekend = day_name in ("Saturday", "Sunday")
+    weekend_str = "It is the WEEKEND — do NOT ask about work, meetings, or productivity unless he brings it up." if is_weekend else "It is a weekday."
+
+    return f"""## ⏰ CURRENT DATE & TIME (source of truth — override everything else)
+Right now it is: {day_name}, {current_time} ({tod})
+Today's date: {today_str}
+{weekend_str}
+NEVER use timestamps from conversation history or memories as the current time. The time above is the ONLY correct time.
+
+You are Aria, {name}'s personal AI assistant on Telegram.
 
 ## Your Personality
 - Competent, sharp, and genuinely invested in {name}'s success
@@ -147,8 +176,20 @@ Rules for reminders:
 - Today's date is {today_str}. ALWAYS use the correct year ({today_str[:4]}) when including dates
 - If {name} says a relative time like "in 2 hours" or "in 30 minutes", calculate the actual time
 
+## Completing / Cancelling Reminders
+Reminders will nudge {name} every 30 minutes until he acknowledges them. When he indicates a reminder is done, cancelled, or should be rescheduled:
+
+When {name} says he's done a reminded task (e.g. "done", "I did it", "taken care of"):
+<done>[keyword from the reminder message]</done>
+
+When {name} wants to cancel/stop a reminder (e.g. "stop reminding me about...", "cancel the..."):
+<cancel_reminder>[keyword from the reminder message]</cancel_reminder>
+
+When {name} wants to reschedule, use <cancel_reminder> for the old one AND <reminder> for the new time.
+
+Check the Active/Upcoming Reminders section above to match the right keyword. ALWAYS use one of these tags when {name} acknowledges or dismisses a reminder — otherwise it will keep nudging him.
+
 ## Context
-- CURRENT TIME RIGHT NOW: {current_time} ({tod}). Today's date: {today_str}. Always use this as the source of truth for the current time — ignore any timestamps or time references in older messages.
 - {name} is a developer based in Singapore
 - He builds productivity tools and games, values minimalist design and efficiency
 - He has a personal dashboard system (finances, dating pipeline, todos via Telegram bot + Supabase + React)
@@ -159,6 +200,7 @@ Rules for reminders:
 {prefs_block}
 {search_block}
 {dashboard_block}
+{reminders_block}
 
 ## Memory Extraction
 When {name} shares something important — a goal, preference, deadline, personal detail, or commitment — note it by including a <memory> tag at the END of your response (after your visible reply):
@@ -166,6 +208,17 @@ When {name} shares something important — a goal, preference, deadline, persona
 
 Categories: personal, preference, goal, task, relationship, habit, work, health, interest, other
 Only extract genuinely useful info, not casual chit-chat. Multiple tags OK if needed.
+
+## Forgetting / Resolving Memories
+When {name} tells you something is done, resolved, no longer relevant, or asks you to stop following up on something, you MUST include a <forget> tag to deactivate the old memory:
+<forget>[keyword or phrase from the original memory]</forget>
+
+This is CRITICAL. Examples:
+- "{name} says 'I already took the earrings out'" → <forget>earring</forget>
+- "{name} says 'stop reminding me about the dentist'" → <forget>dentist</forget>
+- "{name} says 'I quit that job'" → <forget>works at</forget> and add a new memory with the update
+- "{name} says 'nevermind about the gym goal'" → <forget>gym</forget>
+The search term should match a keyword in the original memory content. Use the memory list above to find the right term. You can include multiple <forget> tags. ALWAYS forget before adding an updated memory — otherwise both the old and new memory will coexist and cause confusion.
 
 IMPORTANT — Time-aware memories:
 - When {name} mentions something with a time context (e.g. "I'm sleeping at 2am", "I have a meeting tomorrow at 3pm", "I went to the gym yesterday"), ALWAYS include the actual date/time in the memory content itself.
@@ -304,6 +357,21 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         # Schedule reminders (attach to response so handler can process)
         if reminders:
             clean_text = _attach_reminder_confirmations(clean_text, reminders)
+
+        # ── Parse forgets ───────────────────────────────────
+        clean_text, forget_terms = parse_forgets(clean_text)
+        if forget_terms:
+            process_forgets(user_id, forget_terms)
+
+        # ── Parse reminder completions ──────────────────────
+        clean_text, done_terms = parse_done_tags(clean_text)
+        if done_terms:
+            process_done_reminders(user_id, done_terms)
+
+        # ── Parse reminder cancellations ────────────────────
+        clean_text, cancel_terms = parse_cancel_tags(clean_text)
+        if cancel_terms:
+            process_cancel_reminders(user_id, cancel_terms)
 
         # Stash reminders on the module level so the handler can pick them up
         _last_reminders.clear()
@@ -523,6 +591,21 @@ _REMINDER_RE = re.compile(
     re.DOTALL,
 )
 
+_FORGET_RE = re.compile(
+    r'<forget>(.*?)</forget>',
+    re.DOTALL,
+)
+
+_DONE_RE = re.compile(
+    r'<done>(.*?)</done>',
+    re.DOTALL,
+)
+
+_CANCEL_REMINDER_RE = re.compile(
+    r'<cancel_reminder>(.*?)</cancel_reminder>',
+    re.DOTALL,
+)
+
 
 def _parse_memories(text: str) -> tuple[str, list[dict]]:
     """Extract <memory> tags and return (clean_text, list_of_memories)."""
@@ -602,4 +685,70 @@ def _attach_reminder_confirmations(text: str, reminders: list[dict]) -> str:
     """If Aria didn't already confirm the reminder, we don't add anything —
     the system prompt tells her to confirm naturally in her response."""
     return text
+
+
+def parse_forgets(text: str) -> tuple[str, list[str]]:
+    """Extract <forget> tags and return (clean_text, list_of_search_terms)."""
+    terms = []
+    for m in _FORGET_RE.finditer(text):
+        term = m.group(1).strip()
+        if term:
+            terms.append(term)
+    clean = _FORGET_RE.sub("", text).strip()
+    return clean, terms
+
+
+def process_forgets(user_id: int, forget_terms: list[str]) -> int:
+    """Deactivate memories matching the forget terms. Returns total deactivated."""
+    total = 0
+    for term in forget_terms:
+        count = deactivate_memories_matching(user_id, term)
+        total += count
+        if count:
+            log.info(f"Forgot {count} memories matching '{term}'")
+        else:
+            log.info(f"No memories matched forget term: '{term}'")
+    return total
+
+
+def parse_done_tags(text: str) -> tuple[str, list[str]]:
+    """Extract <done> tags — keywords to match reminders to mark as completed."""
+    terms = []
+    for m in _DONE_RE.finditer(text):
+        term = m.group(1).strip()
+        if term:
+            terms.append(term)
+    clean = _DONE_RE.sub("", text).strip()
+    return clean, terms
+
+
+def parse_cancel_tags(text: str) -> tuple[str, list[str]]:
+    """Extract <cancel_reminder> tags — keywords to match reminders to cancel."""
+    terms = []
+    for m in _CANCEL_REMINDER_RE.finditer(text):
+        term = m.group(1).strip()
+        if term:
+            terms.append(term)
+    clean = _CANCEL_REMINDER_RE.sub("", text).strip()
+    return clean, terms
+
+
+def process_done_reminders(user_id: int, terms: list[str]) -> int:
+    """Mark reminders as done by keyword match."""
+    total = 0
+    for term in terms:
+        count = complete_reminders_matching(user_id, term)
+        total += count
+        log.info(f"Completed {count} reminders matching '{term}'")
+    return total
+
+
+def process_cancel_reminders(user_id: int, terms: list[str]) -> int:
+    """Cancel reminders by keyword match."""
+    total = 0
+    for term in terms:
+        count = cancel_reminders_matching(user_id, term)
+        total += count
+        log.info(f"Cancelled {count} reminders matching '{term}'")
+    return total
 
