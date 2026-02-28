@@ -87,6 +87,16 @@ def _build_system_prompt(
                 + dashboard_svc.format_for_context(grouped)
             )
 
+    # Wiki titles (so Aria knows what's available)
+    wiki_block = ""
+    if dashboard_svc.is_configured():
+        wiki_titles = dashboard_svc.get_wiki_titles()
+        if wiki_titles:
+            wiki_block = (
+                f"\n## {name}'s Wiki Pages (titles only — use <wiki_search> to read content)\n"
+                + dashboard_svc.format_wiki_titles_for_context(wiki_titles)
+            )
+
     # Upcoming reminders (3-day horizon)
     reminders_block = ""
     try:
@@ -162,6 +172,17 @@ Rules for search:
 - You can include multiple <search> tags for complex queries
 - For image searches, use: <image_search>your query</image_search> to find relevant images to send''' if web_search_available else ""}
 
+## Personal Wiki
+{name} has a personal wiki with his notes, thoughts, and knowledge base. You can see the list of page titles in the context below. When {name} asks about a topic that might be in his wiki, or when you need to reference his notes, use:
+<wiki_search>search term</wiki_search>
+
+Rules for wiki search:
+- Place the <wiki_search> tag BEFORE your response text — wiki content will be provided and you'll answer with it
+- Use short, relevant keywords (e.g. "human labour", "dating strategy", "investment")
+- Check the wiki titles list first — if a title clearly matches, search for that
+- You can combine wiki search with web search in the same response
+- Summarize wiki content naturally — don't just dump it back at {name}
+
 ## Reminders
 When {name} asks you to remind him about something at a specific time, include a reminder tag at the END of your response:
 <reminder time="HH:MM" date="YYYY-MM-DD">[reminder message]</reminder>
@@ -200,6 +221,7 @@ Check the Active/Upcoming Reminders section above to match the right keyword. AL
 {prefs_block}
 {search_block}
 {dashboard_block}
+{wiki_block}
 {reminders_block}
 
 ## Memory Extraction
@@ -299,8 +321,9 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         # ── Check for search requests ────────────────────────
         search_queries = _SEARCH_RE.findall(full_text)
         image_search_queries = _IMAGE_SEARCH_RE.findall(full_text)
+        wiki_search_queries = _WIKI_SEARCH_RE.findall(full_text)
 
-        if search_queries or image_search_queries:
+        if search_queries or image_search_queries or wiki_search_queries:
             # Execute searches
             search_results_text = ""
             if search_queries:
@@ -318,6 +341,16 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
                         search_results_text += f"\n### Image results for: {query.strip()}\n"
                         for img in imgs:
                             search_results_text += f"- {img['title']}: {img['image_url']}\n"
+
+            # Execute wiki searches
+            wiki_results_text = ""
+            if wiki_search_queries:
+                for query in wiki_search_queries:
+                    pages = dashboard_svc.search_wiki(query.strip())
+                    wiki_results_text += f"\n### Wiki results for: {query.strip()}\n"
+                    wiki_results_text += dashboard_svc.format_wiki_results_for_context(pages)
+                if wiki_results_text:
+                    search_results_text += f"\n## Wiki Content\n{wiki_results_text}"
 
             # Second pass with search results
             system_with_search = _build_system_prompt(
@@ -338,6 +371,7 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         # ── Strip search tags from final output ──────────────
         full_text = _SEARCH_RE.sub("", full_text)
         full_text = _IMAGE_SEARCH_RE.sub("", full_text)
+        full_text = _WIKI_SEARCH_RE.sub("", full_text)
 
         # ── Parse memories ───────────────────────────────────
         clean_text, extracted = _parse_memories(full_text)
@@ -583,6 +617,11 @@ _SEARCH_RE = re.compile(
 
 _IMAGE_SEARCH_RE = re.compile(
     r'<image_search>(.*?)</image_search>',
+    re.DOTALL,
+)
+
+_WIKI_SEARCH_RE = re.compile(
+    r'<wiki_search>(.*?)</wiki_search>',
     re.DOTALL,
 )
 

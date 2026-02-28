@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-echo "🔧 Patching Aria Bot — Fix timezone + dashboard limit..."
+echo "🔧 Patching Aria Bot — Wiki access + timezone fix + dashboard limit..."
 
 cat > src/config.py << 'PYEOF'
 """Central configuration — reads env vars once, validates, exports."""
@@ -681,6 +681,113 @@ def format_for_context(grouped_data: dict[str, list[dict]]) -> str:
 
     return "\n\n".join(sections)
 
+
+# ── Wiki ─────────────────────────────────────────────────────
+
+
+def get_wiki_titles() -> list[dict]:
+    """Fetch all wiki page titles and slugs for context listing."""
+    db = _get_dashboard_db()
+    if not db:
+        return []
+
+    try:
+        result = (
+            db.table("wiki_pages")
+            .select("title, slug, updated_at")
+            .order("updated_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        log.error(f"Wiki titles fetch error: {e}")
+        return []
+
+
+def search_wiki(query: str, limit: int = 5) -> list[dict]:
+    """Search wiki pages by title or content (case-insensitive).
+    Returns matching pages with full content."""
+    db = _get_dashboard_db()
+    if not db:
+        return []
+
+    try:
+        # Search in title
+        title_results = (
+            db.table("wiki_pages")
+            .select("title, slug, content, updated_at")
+            .ilike("title", f"%{query}%")
+            .limit(limit)
+            .execute()
+        )
+
+        # Search in content
+        content_results = (
+            db.table("wiki_pages")
+            .select("title, slug, content, updated_at")
+            .ilike("content", f"%{query}%")
+            .limit(limit)
+            .execute()
+        )
+
+        # Deduplicate by slug
+        seen = set()
+        results = []
+        for row in (title_results.data or []) + (content_results.data or []):
+            if row["slug"] not in seen:
+                seen.add(row["slug"])
+                results.append(row)
+
+        return results[:limit]
+    except Exception as e:
+        log.error(f"Wiki search error: {e}")
+        return []
+
+
+def get_wiki_page(slug: str) -> dict | None:
+    """Fetch a single wiki page by slug."""
+    db = _get_dashboard_db()
+    if not db:
+        return None
+
+    try:
+        result = (
+            db.table("wiki_pages")
+            .select("title, slug, content, updated_at")
+            .eq("slug", slug)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as e:
+        log.error(f"Wiki page fetch error: {e}")
+        return None
+
+
+def format_wiki_titles_for_context(titles: list[dict]) -> str:
+    """Format wiki titles into a compact list for Claude's context."""
+    if not titles:
+        return ""
+    lines = [f"  - {t['title']}" for t in titles]
+    return "\n".join(lines)
+
+
+def format_wiki_results_for_context(pages: list[dict]) -> str:
+    """Format full wiki pages for Claude's context after a search."""
+    if not pages:
+        return "No wiki pages matched your search."
+
+    sections = []
+    for page in pages:
+        content = page.get("content", "")
+        # Truncate very long pages
+        if len(content) > 2000:
+            content = content[:2000] + "\n... (truncated)"
+        sections.append(f"### {page['title']}\n{content}")
+
+    return "\n\n".join(sections)
+
 PYEOF
 
 cat > src/services/web_search.py << 'PYEOF'
@@ -890,6 +997,16 @@ def _build_system_prompt(
                 + dashboard_svc.format_for_context(grouped)
             )
 
+    # Wiki titles (so Aria knows what's available)
+    wiki_block = ""
+    if dashboard_svc.is_configured():
+        wiki_titles = dashboard_svc.get_wiki_titles()
+        if wiki_titles:
+            wiki_block = (
+                f"\n## {name}'s Wiki Pages (titles only — use <wiki_search> to read content)\n"
+                + dashboard_svc.format_wiki_titles_for_context(wiki_titles)
+            )
+
     # Upcoming reminders (3-day horizon)
     reminders_block = ""
     try:
@@ -965,6 +1082,17 @@ Rules for search:
 - You can include multiple <search> tags for complex queries
 - For image searches, use: <image_search>your query</image_search> to find relevant images to send''' if web_search_available else ""}
 
+## Personal Wiki
+{name} has a personal wiki with his notes, thoughts, and knowledge base. You can see the list of page titles in the context below. When {name} asks about a topic that might be in his wiki, or when you need to reference his notes, use:
+<wiki_search>search term</wiki_search>
+
+Rules for wiki search:
+- Place the <wiki_search> tag BEFORE your response text — wiki content will be provided and you'll answer with it
+- Use short, relevant keywords (e.g. "human labour", "dating strategy", "investment")
+- Check the wiki titles list first — if a title clearly matches, search for that
+- You can combine wiki search with web search in the same response
+- Summarize wiki content naturally — don't just dump it back at {name}
+
 ## Reminders
 When {name} asks you to remind him about something at a specific time, include a reminder tag at the END of your response:
 <reminder time="HH:MM" date="YYYY-MM-DD">[reminder message]</reminder>
@@ -1003,6 +1131,7 @@ Check the Active/Upcoming Reminders section above to match the right keyword. AL
 {prefs_block}
 {search_block}
 {dashboard_block}
+{wiki_block}
 {reminders_block}
 
 ## Memory Extraction
@@ -1102,8 +1231,9 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         # ── Check for search requests ────────────────────────
         search_queries = _SEARCH_RE.findall(full_text)
         image_search_queries = _IMAGE_SEARCH_RE.findall(full_text)
+        wiki_search_queries = _WIKI_SEARCH_RE.findall(full_text)
 
-        if search_queries or image_search_queries:
+        if search_queries or image_search_queries or wiki_search_queries:
             # Execute searches
             search_results_text = ""
             if search_queries:
@@ -1121,6 +1251,16 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
                         search_results_text += f"\n### Image results for: {query.strip()}\n"
                         for img in imgs:
                             search_results_text += f"- {img['title']}: {img['image_url']}\n"
+
+            # Execute wiki searches
+            wiki_results_text = ""
+            if wiki_search_queries:
+                for query in wiki_search_queries:
+                    pages = dashboard_svc.search_wiki(query.strip())
+                    wiki_results_text += f"\n### Wiki results for: {query.strip()}\n"
+                    wiki_results_text += dashboard_svc.format_wiki_results_for_context(pages)
+                if wiki_results_text:
+                    search_results_text += f"\n## Wiki Content\n{wiki_results_text}"
 
             # Second pass with search results
             system_with_search = _build_system_prompt(
@@ -1141,6 +1281,7 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         # ── Strip search tags from final output ──────────────
         full_text = _SEARCH_RE.sub("", full_text)
         full_text = _IMAGE_SEARCH_RE.sub("", full_text)
+        full_text = _WIKI_SEARCH_RE.sub("", full_text)
 
         # ── Parse memories ───────────────────────────────────
         clean_text, extracted = _parse_memories(full_text)
@@ -1386,6 +1527,11 @@ _SEARCH_RE = re.compile(
 
 _IMAGE_SEARCH_RE = re.compile(
     r'<image_search>(.*?)</image_search>',
+    re.DOTALL,
+)
+
+_WIKI_SEARCH_RE = re.compile(
+    r'<wiki_search>(.*?)</wiki_search>',
     re.DOTALL,
 )
 
@@ -2201,10 +2347,13 @@ PYEOF
 echo ""
 echo "✅ Patch applied!"
 echo ""
-echo "Fixes:"
-echo "  🕐 Memory timestamps now converted from UTC to SGT"
-echo "     (was showing 8 hours off — 'this morning' looked like '8 hours ago')"
-echo "  📊 Dashboard limit bumped from 3 to 10 entries per category"
-echo "     (Aria can now see all your dating prospects)"
+echo "Changes:"
+echo "  📖 Wiki access — Aria sees all page titles in context"
+echo "     Uses <wiki_search> tag to fetch full content on demand"
+echo "     Searches both title and content (case-insensitive)"
+echo "  🕐 Memory timestamps converted UTC → SGT (8hr offset fixed)"
+echo "  📊 Dashboard limit bumped to 10 entries per category"
 echo ""
-echo "Then: git add -A && git commit -m \"Fix timezone + dashboard limit\" && git push"
+echo "No SQL migration needed — wiki_pages table already exists."
+echo ""
+echo "Then: git add -A && git commit -m \"Add wiki access + timezone fix\" && git push"

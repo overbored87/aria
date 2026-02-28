@@ -139,3 +139,110 @@ def format_for_context(grouped_data: dict[str, list[dict]]) -> str:
 
     return "\n\n".join(sections)
 
+
+# ── Wiki ─────────────────────────────────────────────────────
+
+
+def get_wiki_titles() -> list[dict]:
+    """Fetch all wiki page titles and slugs for context listing."""
+    db = _get_dashboard_db()
+    if not db:
+        return []
+
+    try:
+        result = (
+            db.table("wiki_pages")
+            .select("title, slug, updated_at")
+            .order("updated_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        log.error(f"Wiki titles fetch error: {e}")
+        return []
+
+
+def search_wiki(query: str, limit: int = 5) -> list[dict]:
+    """Search wiki pages by title or content (case-insensitive).
+    Returns matching pages with full content."""
+    db = _get_dashboard_db()
+    if not db:
+        return []
+
+    try:
+        # Search in title
+        title_results = (
+            db.table("wiki_pages")
+            .select("title, slug, content, updated_at")
+            .ilike("title", f"%{query}%")
+            .limit(limit)
+            .execute()
+        )
+
+        # Search in content
+        content_results = (
+            db.table("wiki_pages")
+            .select("title, slug, content, updated_at")
+            .ilike("content", f"%{query}%")
+            .limit(limit)
+            .execute()
+        )
+
+        # Deduplicate by slug
+        seen = set()
+        results = []
+        for row in (title_results.data or []) + (content_results.data or []):
+            if row["slug"] not in seen:
+                seen.add(row["slug"])
+                results.append(row)
+
+        return results[:limit]
+    except Exception as e:
+        log.error(f"Wiki search error: {e}")
+        return []
+
+
+def get_wiki_page(slug: str) -> dict | None:
+    """Fetch a single wiki page by slug."""
+    db = _get_dashboard_db()
+    if not db:
+        return None
+
+    try:
+        result = (
+            db.table("wiki_pages")
+            .select("title, slug, content, updated_at")
+            .eq("slug", slug)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+    except Exception as e:
+        log.error(f"Wiki page fetch error: {e}")
+        return None
+
+
+def format_wiki_titles_for_context(titles: list[dict]) -> str:
+    """Format wiki titles into a compact list for Claude's context."""
+    if not titles:
+        return ""
+    lines = [f"  - {t['title']}" for t in titles]
+    return "\n".join(lines)
+
+
+def format_wiki_results_for_context(pages: list[dict]) -> str:
+    """Format full wiki pages for Claude's context after a search."""
+    if not pages:
+        return "No wiki pages matched your search."
+
+    sections = []
+    for page in pages:
+        content = page.get("content", "")
+        # Truncate very long pages
+        if len(content) > 2000:
+            content = content[:2000] + "\n... (truncated)"
+        sections.append(f"### {page['title']}\n{content}")
+
+    return "\n\n".join(sections)
+
