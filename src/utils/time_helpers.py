@@ -48,6 +48,19 @@ def time_of_day() -> str:
     return "night"
 
 
+def utc_to_user(iso_str: str) -> str:
+    """Convert a UTC ISO timestamp from Supabase to user-timezone formatted string."""
+    try:
+        # Supabase returns ISO like "2026-02-28T09:00:00+00:00" or "2026-02-28T09:00:00"
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(_tz)
+        return local.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso_str[:16].replace("T", " ")
+
+
 def estimate_tokens(text: str) -> int:
     """Rough token estimate (≈4 chars/token)."""
     return max(1, len(text) // 4)

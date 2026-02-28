@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-echo "🔧 Patching Aria Bot — Persistent Nudging Reminders..."
+echo "🔧 Patching Aria Bot — Fix timezone + dashboard limit..."
 
 cat > src/config.py << 'PYEOF'
 """Central configuration — reads env vars once, validates, exports."""
@@ -117,6 +117,19 @@ def time_of_day() -> str:
     if h < 21:
         return "evening"
     return "night"
+
+
+def utc_to_user(iso_str: str) -> str:
+    """Convert a UTC ISO timestamp from Supabase to user-timezone formatted string."""
+    try:
+        # Supabase returns ISO like "2026-02-28T09:00:00+00:00" or "2026-02-28T09:00:00"
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(_tz)
+        return local.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso_str[:16].replace("T", " ")
 
 
 def estimate_tokens(text: str) -> int:
@@ -803,7 +816,7 @@ import anthropic
 
 from src.config import cfg
 from src.utils.logger import log
-from src.utils.time_helpers import format_user_time, time_of_day, now_user
+from src.utils.time_helpers import format_user_time, time_of_day, now_user, utc_to_user
 from src.services.database import (
     get_recent_conversation,
     get_active_memories,
@@ -845,7 +858,7 @@ def _build_system_prompt(
     if memories:
         mem_lines = []
         for m in memories:
-            ts = m.get("created_at", "")[:16].replace("T", " ") if m.get("created_at") else ""
+            ts = utc_to_user(m["created_at"]) if m.get("created_at") else ""
             mem_lines.append(f"- [{m['category']}] ({ts}) {m['content']}")
         memory_block = "\n".join(mem_lines)
     else:
@@ -870,7 +883,7 @@ def _build_system_prompt(
 
     dashboard_block = ""
     if dashboard_svc.is_configured():
-        grouped = dashboard_svc.get_latest_by_category(limit_per_category=3)
+        grouped = dashboard_svc.get_latest_by_category(limit_per_category=10)
         if grouped:
             dashboard_block = (
                 f"\n## {name}'s Dashboard Data (from his personal tracking system)\n"
@@ -2188,15 +2201,10 @@ PYEOF
 echo ""
 echo "✅ Patch applied!"
 echo ""
-echo "⚠️  Run reminders_migration.sql in Aria's Supabase BEFORE deploying!"
+echo "Fixes:"
+echo "  🕐 Memory timestamps now converted from UTC to SGT"
+echo "     (was showing 8 hours off — 'this morning' looked like '8 hours ago')"
+echo "  📊 Dashboard limit bumped from 3 to 10 entries per category"
+echo "     (Aria can now see all your dating prospects)"
 echo ""
-echo "Reminder lifecycle:"
-echo "  1. You: 'remind me to X at 9pm'"
-echo "  2. Aria saves reminder → status: pending"
-echo "  3. At 9pm, sweep sends it → status: active"
-echo "  4. Every 30 min, nudge sent until you respond"
-echo "  5. You: 'done' → Aria outputs <done>X</done> → status: done"
-echo "  6. Or: 'cancel it' → <cancel_reminder>X</cancel_reminder> → status: cancelled"
-echo "  7. Or: 'reschedule to 10pm' → cancel old + create new"
-echo ""
-echo "Then: git add -A && git commit -m 'Persistent nudging reminders' && git push"
+echo "Then: git add -A && git commit -m \"Fix timezone + dashboard limit\" && git push"

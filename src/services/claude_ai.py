@@ -13,7 +13,7 @@ import anthropic
 
 from src.config import cfg
 from src.utils.logger import log
-from src.utils.time_helpers import format_user_time, time_of_day, now_user
+from src.utils.time_helpers import format_user_time, time_of_day, now_user, utc_to_user
 from src.services.database import (
     get_recent_conversation,
     get_active_memories,
@@ -55,7 +55,7 @@ def _build_system_prompt(
     if memories:
         mem_lines = []
         for m in memories:
-            ts = m.get("created_at", "")[:16].replace("T", " ") if m.get("created_at") else ""
+            ts = utc_to_user(m["created_at"]) if m.get("created_at") else ""
             mem_lines.append(f"- [{m['category']}] ({ts}) {m['content']}")
         memory_block = "\n".join(mem_lines)
     else:
@@ -80,7 +80,7 @@ def _build_system_prompt(
 
     dashboard_block = ""
     if dashboard_svc.is_configured():
-        grouped = dashboard_svc.get_latest_by_category(limit_per_category=3)
+        grouped = dashboard_svc.get_latest_by_category(limit_per_category=10)
         if grouped:
             dashboard_block = (
                 f"\n## {name}'s Dashboard Data (from his personal tracking system)\n"
