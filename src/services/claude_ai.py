@@ -45,6 +45,7 @@ def _build_system_prompt(
     summaries: list[dict],
     user_preferences: dict | None = None,
     search_results: str | None = None,
+    wiki_context: str | None = None,
 ) -> str:
     tod = time_of_day()
     current_time = format_user_time()
@@ -87,15 +88,17 @@ def _build_system_prompt(
                 + dashboard_svc.format_for_context(grouped)
             )
 
-    # Wiki titles (so Aria knows what's available)
+    # Wiki: titles always loaded, content from auto-search passed in
     wiki_block = ""
     if dashboard_svc.is_configured():
         wiki_titles = dashboard_svc.get_wiki_titles()
         if wiki_titles:
             wiki_block = (
-                f"\n## {name}'s Wiki Pages (titles only — use <wiki_search> to read content)\n"
+                f"\n## {name}'s Wiki Pages\n"
                 + dashboard_svc.format_wiki_titles_for_context(wiki_titles)
             )
+        if wiki_context:
+            wiki_block += f"\n\n## Wiki Content (auto-loaded from matching pages)\n{wiki_context}"
 
     # Upcoming reminders (3-day horizon)
     reminders_block = ""
@@ -173,15 +176,34 @@ Rules for search:
 - For image searches, use: <image_search>your query</image_search> to find relevant images to send''' if web_search_available else ""}
 
 ## Personal Wiki
-{name} has a personal wiki with his notes, thoughts, and knowledge base. You can see the list of page titles in the context below. When {name} asks about a topic that might be in his wiki, or when you need to reference his notes, use:
+{name} has a personal wiki with his notes, thoughts, and knowledge base. The titles are listed below, and relevant wiki content matching this conversation has been auto-loaded into context.
+
+If you need content from a specific wiki page that wasn't auto-loaded, you can search manually:
 <wiki_search>search term</wiki_search>
 
-Rules for wiki search:
-- Place the <wiki_search> tag BEFORE your response text — wiki content will be provided and you'll answer with it
-- Use short, relevant keywords (e.g. "human labour", "dating strategy", "investment")
-- Check the wiki titles list first — if a title clearly matches, search for that
-- You can combine wiki search with web search in the same response
-- Summarize wiki content naturally — don't just dump it back at {name}
+### Reading wiki:
+- Relevant pages are automatically searched and included — check the "Wiki Content" section below before searching manually
+- If you need a specific page not auto-loaded, use <wiki_search> with short keywords
+- Summarize wiki content naturally — don't dump raw text at {name}
+
+### Creating wiki pages:
+When {name} asks you to create a new wiki page, draft it and include:
+<wiki_create slug="my-page-slug" title="My Page Title">
+Your drafted content here in plain text or markdown.
+</wiki_create>
+
+### Editing wiki pages:
+When {name} asks you to update/edit an existing wiki page, include:
+<wiki_update slug="existing-page-slug">
+The complete updated content for the page.
+</wiki_update>
+
+Rules for wiki edits:
+- Always show {name} a summary of what you're creating/editing in your visible response
+- Slugs should be lowercase, hyphen-separated (e.g. "ai-governance", "dating-strategy")
+- For updates, include the FULL page content (not just the changes) — it replaces the existing content
+- {name} will see a preview with Approve/Reject buttons before anything is written
+- Check existing page slugs in the wiki titles list to avoid duplicates
 
 ## Reminders
 When {name} asks you to remind him about something at a specific time, include a reminder tag at the END of your response:
@@ -281,7 +303,15 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         summaries = get_recent_summaries(user_id, 3)
         history = get_recent_conversation(user_id)
 
-        system = _build_system_prompt(memories, summaries)
+        # Auto-search wiki based on user message keywords
+        wiki_context = None
+        if dashboard_svc.is_configured() and user_message:
+            auto_wiki_pages = dashboard_svc.auto_search_wiki(user_message, max_results=3)
+            if auto_wiki_pages:
+                wiki_context = dashboard_svc.format_wiki_results_for_context(auto_wiki_pages)
+                log.info(f"Wiki auto-search found {len(auto_wiki_pages)} pages: {[p['title'] for p in auto_wiki_pages]}")
+
+        system = _build_system_prompt(memories, summaries, wiki_context=wiki_context)
 
         # Build the user message content (text + optional image)
         if image_data:
@@ -354,7 +384,7 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
 
             # Second pass with search results
             system_with_search = _build_system_prompt(
-                memories, summaries, search_results=search_results_text
+                memories, summaries, search_results=search_results_text, wiki_context=wiki_context
             )
 
             response2 = get_client().messages.create(
@@ -407,9 +437,16 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         if cancel_terms:
             process_cancel_reminders(user_id, cancel_terms)
 
-        # Stash reminders on the module level so the handler can pick them up
+        # ── Parse wiki edits (stored pending approval) ──────
+        clean_text, wiki_edits = parse_wiki_edits(clean_text)
+        if wiki_edits:
+            log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
+
+        # Stash reminders and wiki edits for the handler
         _last_reminders.clear()
         _last_reminders.extend(reminders)
+        _last_wiki_edits.clear()
+        _last_wiki_edits.extend(wiki_edits)
 
         return clean_text
 
@@ -426,6 +463,7 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
 
 # Temp storage for reminders between generate_response and handler
 _last_reminders: list[dict] = []
+_last_wiki_edits: list[dict] = []
 
 
 def get_pending_reminders() -> list[dict]:
@@ -433,6 +471,13 @@ def get_pending_reminders() -> list[dict]:
     reminders = list(_last_reminders)
     _last_reminders.clear()
     return reminders
+
+
+def get_pending_wiki_edits_from_response() -> list[dict]:
+    """Pop wiki edits extracted from the last response."""
+    edits = list(_last_wiki_edits)
+    _last_wiki_edits.clear()
+    return edits
 
 
 # ─── Proactive Message Generation ───────────────────────────
@@ -645,6 +690,16 @@ _CANCEL_REMINDER_RE = re.compile(
     re.DOTALL,
 )
 
+_WIKI_CREATE_RE = re.compile(
+    r'<wiki_create\s+slug="([^"]+)"\s+title="([^"]+)">(.*?)</wiki_create>',
+    re.DOTALL,
+)
+
+_WIKI_UPDATE_RE = re.compile(
+    r'<wiki_update\s+slug="([^"]+)">(.*?)</wiki_update>',
+    re.DOTALL,
+)
+
 
 def _parse_memories(text: str) -> tuple[str, list[dict]]:
     """Extract <memory> tags and return (clean_text, list_of_memories)."""
@@ -790,4 +845,55 @@ def process_cancel_reminders(user_id: int, terms: list[str]) -> int:
         total += count
         log.info(f"Cancelled {count} reminders matching '{term}'")
     return total
+
+
+# ─── Wiki Edit Tags ──────────────────────────────────────────
+
+# Pending wiki edits awaiting user approval: {edit_id: {type, slug, title, content}}
+_pending_wiki_edits: dict[str, dict] = {}
+
+
+def parse_wiki_edits(text: str) -> tuple[str, list[dict]]:
+    """Extract <wiki_create> and <wiki_update> tags.
+    Returns (clean_text, list_of_edits)."""
+    import uuid
+    edits = []
+
+    for m in _WIKI_CREATE_RE.finditer(text):
+        edit_id = str(uuid.uuid4())[:8]
+        edit = {
+            "id": edit_id,
+            "type": "create",
+            "slug": m.group(1).strip(),
+            "title": m.group(2).strip(),
+            "content": m.group(3).strip(),
+        }
+        edits.append(edit)
+        _pending_wiki_edits[edit_id] = edit
+
+    for m in _WIKI_UPDATE_RE.finditer(text):
+        edit_id = str(uuid.uuid4())[:8]
+        edit = {
+            "id": edit_id,
+            "type": "update",
+            "slug": m.group(1).strip(),
+            "title": None,
+            "content": m.group(2).strip(),
+        }
+        edits.append(edit)
+        _pending_wiki_edits[edit_id] = edit
+
+    clean = _WIKI_CREATE_RE.sub("", text)
+    clean = _WIKI_UPDATE_RE.sub("", clean).strip()
+    return clean, edits
+
+
+def get_pending_wiki_edit(edit_id: str) -> dict | None:
+    """Retrieve a pending wiki edit by ID."""
+    return _pending_wiki_edits.get(edit_id)
+
+
+def remove_pending_wiki_edit(edit_id: str) -> None:
+    """Remove a pending wiki edit after approval/rejection."""
+    _pending_wiki_edits.pop(edit_id, None)
 
