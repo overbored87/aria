@@ -157,19 +157,17 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Ensure user exists
     ensure_user(user)
 
-    # Save user message
-    save_message(user_id, "user", text, metadata={
-        "message_id": update.message.message_id,
-        "chat_id": update.effective_chat.id,
-    })
-
     # Show typing indicator
     await update.effective_chat.send_action("typing")
 
     # Generate response
     response_text = generate_response(user_id, text)
 
-    # Save full assistant response
+    # Save both messages AFTER generation (so history doesn't double-include the current message)
+    save_message(user_id, "user", text, metadata={
+        "message_id": update.message.message_id,
+        "chat_id": update.effective_chat.id,
+    })
     save_message(user_id, "assistant", response_text)
 
     # Schedule any reminders that were parsed
@@ -220,13 +218,6 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     log.info(f"Photo downloaded: {len(photo_bytes)} bytes, sending to Claude")
 
-    # Save user message (text description of the image)
-    save_message(user_id, "user", f"[Sent a photo] {caption}".strip(), metadata={
-        "message_id": update.message.message_id,
-        "chat_id": update.effective_chat.id,
-        "has_image": True,
-    })
-
     # Show typing
     await update.effective_chat.send_action("typing")
 
@@ -234,7 +225,12 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     image_data = {"base64": b64_data, "media_type": media_type}
     response_text = generate_response(user_id, caption, image_data=image_data)
 
-    # Save response
+    # Save both messages AFTER generation
+    save_message(user_id, "user", f"[Sent a photo] {caption}".strip(), metadata={
+        "message_id": update.message.message_id,
+        "chat_id": update.effective_chat.id,
+        "has_image": True,
+    })
     save_message(user_id, "assistant", response_text)
 
     # Schedule reminders
