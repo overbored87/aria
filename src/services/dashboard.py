@@ -312,6 +312,52 @@ def get_wiki_page(slug: str) -> dict | None:
         return None
 
 
+def _markdown_to_html(text: str) -> str:
+    """Basic markdown to HTML conversion for Tiptap compatibility."""
+    import re as _re
+    lines = text.split("\n")
+    html_lines = []
+    in_list = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append("")
+            continue
+
+        # Headers
+        if stripped.startswith("### "):
+            html_lines.append(f"<h3>{stripped[4:]}</h3>")
+        elif stripped.startswith("## "):
+            html_lines.append(f"<h2>{stripped[3:]}</h2>")
+        elif stripped.startswith("# "):
+            html_lines.append(f"<h1>{stripped[2:]}</h1>")
+        # List items
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+            if not in_list:
+                html_lines.append("<ul>")
+                in_list = True
+            html_lines.append(f"<li>{stripped[2:]}</li>")
+        else:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append(f"<p>{stripped}</p>")
+
+    if in_list:
+        html_lines.append("</ul>")
+
+    result = "\n".join(html_lines)
+    # Inline formatting
+    result = _re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', result)
+    result = _re.sub(r'\*(.+?)\*', r'<em>\1</em>', result)
+    result = _re.sub(r'`(.+?)`', r'<code>\1</code>', result)
+    return result
+
+
 # ── Wiki Write Operations ────────────────────────────────────
 
 
@@ -327,6 +373,7 @@ def create_wiki_page(user_id: int, title: str, slug: str, content: str) -> dict 
             "title": title,
             "slug": slug,
             "content": content,
+            "content_rendered": _markdown_to_html(content),
         }).execute()
         if result.data:
             log.info(f"Wiki page created: {title} ({slug})")
@@ -344,7 +391,11 @@ def update_wiki_page(slug: str, content: str, title: str | None = None) -> dict 
         return None
 
     try:
-        update_data = {"content": content, "updated_at": datetime.utcnow().isoformat()}
+        update_data = {
+            "content": content,
+            "content_rendered": _markdown_to_html(content),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
         if title:
             update_data["title"] = title
 
