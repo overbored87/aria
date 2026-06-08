@@ -363,6 +363,29 @@ def update_wiki_page(slug: str, content: str, title: str | None = None) -> dict 
         return None
 
 
+def delete_wiki_page(slug: str) -> bool:
+    """Delete a wiki page by slug."""
+    db = _get_dashboard_db()
+    if not db:
+        return False
+
+    try:
+        result = (
+            db.table("wiki_pages")
+            .delete()
+            .eq("slug", slug)
+            .execute()
+        )
+        if result.data:
+            log.info(f"Wiki page deleted: {slug}")
+            return True
+        log.warning(f"Wiki page not found for deletion: {slug}")
+        return False
+    except Exception as e:
+        log.error(f"Wiki page delete error: {e}")
+        return False
+
+
 def format_wiki_titles_for_context(titles: list[dict]) -> str:
     """Format wiki titles into a compact list for Claude's context."""
     if not titles:

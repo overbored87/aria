@@ -6,12 +6,11 @@ import asyncio
 import base64
 import re
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -24,12 +23,14 @@ from src.services.claude_ai import (
     parse_images,
     get_pending_reminders,
     get_pending_wiki_edits_from_response,
-    get_pending_wiki_edit,
     remove_pending_wiki_edit,
 )
 from src.services import dashboard as dashboard_svc
 from src.services.summarizer import maybe_summarize
 from src.services.scheduler import schedule_reminder
+
+# Module-level pending wiki edit (only one at a time)
+_pending_wiki_edit: dict | None = None
 
 
 def register_handlers(app: Application) -> None:
@@ -38,7 +39,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("memories", _cmd_memories))
     app.add_handler(CommandHandler("clear", _cmd_clear))
     app.add_handler(CommandHandler("help", _cmd_help))
-    app.add_handler(CallbackQueryHandler(_handle_wiki_callback, pattern=r"^wiki_"))
+    app.add_handler(CommandHandler("approve", _cmd_approve))
+    app.add_handler(CommandHandler("reject", _cmd_reject))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message)
     )
@@ -86,6 +88,8 @@ async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start — Introduction\n"
         "/memories — What I remember about you\n"
         "/clear — Clear conversation (keeps memories)\n"
+        "/approve — Approve a pending wiki edit\n"
+        "/reject — Reject a pending wiki edit\n"
         "/help — This message\n\n"
         "Or just talk to me naturally — I handle tasks, reminders, goals, "
         "and everything in between ✨",
@@ -254,91 +258,115 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def _send_wiki_preview(chat, edit: dict) -> None:
-    """Send a wiki edit preview with Approve/Reject inline buttons."""
+    """Send a truncated wiki edit preview with /approve /reject instructions."""
+    global _pending_wiki_edit
+    _pending_wiki_edit = edit
+
     try:
-        action = "📝 Create" if edit["type"] == "create" else "✏️ Update"
+        if edit["type"] == "create":
+            action = "📝 Create"
+        elif edit["type"] == "delete":
+            action = "🗑️ Delete"
+        else:
+            action = "✏️ Update"
+
         title = edit.get("title") or edit["slug"]
-        content_preview = edit["content"][:500]
-        if len(edit["content"]) > 500:
-            content_preview += "\n... (truncated in preview)"
 
-        preview_text = (
-            f"{action} wiki page: *{title}*\n"
-            f"Slug: `{edit['slug']}`\n\n"
-            f"```\n{content_preview}\n```"
-        )
+        if edit["type"] == "delete":
+            preview_text = (
+                f"{action} wiki page: *{title}*\n"
+                f"Slug: `{edit['slug']}`\n\n"
+                f"This will permanently delete the page.\n\n"
+                f"/approve to confirm • /reject to cancel"
+            )
+        else:
+            # Truncate to ~300 chars for preview
+            content_preview = edit["content"][:300]
+            if len(edit["content"]) > 300:
+                content_preview += "..."
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Approve", callback_data=f"wiki_approve_{edit['id']}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"wiki_reject_{edit['id']}"),
-            ]
-        ])
+            preview_text = (
+                f"{action} wiki page: *{title}*\n"
+                f"Slug: `{edit['slug']}`\n"
+                f"Content: {len(edit['content'])} chars\n\n"
+                f"Preview:\n{content_preview}\n\n"
+                f"/approve to save • /reject to discard"
+            )
 
         try:
-            await chat.send_message(preview_text, parse_mode="Markdown", reply_markup=keyboard)
+            await chat.send_message(preview_text, parse_mode="Markdown")
         except Exception:
-            # Fallback without markdown if formatting fails
-            plain = f"{action} wiki page: {title}\nSlug: {edit['slug']}\n\n{content_preview}"
-            await chat.send_message(plain, reply_markup=keyboard)
+            await chat.send_message(preview_text.replace("*", "").replace("`", ""))
 
     except Exception as e:
         log.error(f"Failed to send wiki preview: {e}")
 
 
-async def _handle_wiki_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle wiki Approve/Reject button presses."""
-    query = update.callback_query
-    await query.answer()
+async def _cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approve a pending wiki edit."""
+    global _pending_wiki_edit
 
     if not _is_authorized(update):
         return
 
-    data = query.data  # e.g. "wiki_approve_abc12345" or "wiki_reject_abc12345"
-    parts = data.split("_", 2)  # ["wiki", "approve", "abc12345"]
-    if len(parts) < 3:
+    if not _pending_wiki_edit:
+        await update.message.reply_text("Nothing pending to approve.")
         return
 
-    action = parts[1]  # "approve" or "reject"
-    edit_id = parts[2]
+    edit = _pending_wiki_edit
+    user_id = cfg.allowed_user_id
+    success = False
 
-    edit = get_pending_wiki_edit(edit_id)
-    if not edit:
-        await query.edit_message_text("⚠️ This edit has expired. Ask Aria to draft it again.")
+    if edit["type"] == "create":
+        result = dashboard_svc.create_wiki_page(
+            user_id=user_id,
+            title=edit["title"],
+            slug=edit["slug"],
+            content=edit["content"],
+        )
+        success = result is not None
+
+    elif edit["type"] == "update":
+        result = dashboard_svc.update_wiki_page(
+            slug=edit["slug"],
+            content=edit["content"],
+            title=edit.get("title"),
+        )
+        success = result is not None
+
+    elif edit["type"] == "delete":
+        result = dashboard_svc.delete_wiki_page(slug=edit["slug"])
+        success = result
+
+    if success:
+        action = {"create": "created", "update": "updated", "delete": "deleted"}[edit["type"]]
+        await update.message.reply_text(f"✅ Wiki page '{edit.get('title') or edit['slug']}' {action}!")
+        log.info(f"Wiki {edit['type']} approved: {edit['slug']}")
+    else:
+        await update.message.reply_text("❌ Failed to save. Check logs.")
+        log.error(f"Wiki {edit['type']} failed: {edit['slug']}")
+
+    remove_pending_wiki_edit(edit["id"])
+    _pending_wiki_edit = None
+
+
+async def _cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reject a pending wiki edit."""
+    global _pending_wiki_edit
+
+    if not _is_authorized(update):
         return
 
-    if action == "approve":
-        user_id = cfg.allowed_user_id
-        success = False
+    if not _pending_wiki_edit:
+        await update.message.reply_text("Nothing pending to reject.")
+        return
 
-        if edit["type"] == "create":
-            result = dashboard_svc.create_wiki_page(
-                user_id=user_id,
-                title=edit["title"],
-                slug=edit["slug"],
-                content=edit["content"],
-            )
-            success = result is not None
-        elif edit["type"] == "update":
-            result = dashboard_svc.update_wiki_page(
-                slug=edit["slug"],
-                content=edit["content"],
-                title=edit.get("title"),
-            )
-            success = result is not None
+    edit = _pending_wiki_edit
+    remove_pending_wiki_edit(edit["id"])
+    _pending_wiki_edit = None
 
-        if success:
-            await query.edit_message_text(f"✅ Wiki page '{edit.get('title') or edit['slug']}' saved!")
-            log.info(f"Wiki {edit['type']} approved: {edit['slug']}")
-        else:
-            await query.edit_message_text(f"❌ Failed to save wiki page. Check logs.")
-            log.error(f"Wiki {edit['type']} failed for: {edit['slug']}")
-
-    elif action == "reject":
-        await query.edit_message_text("❌ Wiki edit rejected.")
-        log.info(f"Wiki {edit['type']} rejected: {edit['slug']}")
-
-    remove_pending_wiki_edit(edit_id)
+    await update.message.reply_text("❌ Wiki edit discarded.")
+    log.info(f"Wiki {edit['type']} rejected: {edit['slug']}")
 
 
 # ─── Multi-Message Sender ───────────────────────────────────

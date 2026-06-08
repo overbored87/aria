@@ -198,12 +198,17 @@ When {name} asks you to update/edit an existing wiki page, include:
 The complete updated content for the page.
 </wiki_update>
 
+### Deleting wiki pages:
+When {name} asks you to delete a wiki page:
+<wiki_delete slug="existing-page-slug" />
+
 Rules for wiki edits:
-- Always show {name} a summary of what you're creating/editing in your visible response
+- {name} will see a truncated preview and type /approve or /reject — nothing is written without approval
+- In your visible response, briefly describe what you're creating/editing/deleting — do NOT reproduce the full content
 - Slugs should be lowercase, hyphen-separated (e.g. "ai-governance", "dating-strategy")
 - For updates, include the FULL page content (not just the changes) — it replaces the existing content
-- {name} will see a preview with Approve/Reject buttons before anything is written
 - Check existing page slugs in the wiki titles list to avoid duplicates
+- You MUST use these tags when asked to create, edit, or delete wiki pages — do not just show content as text
 
 ## Reminders
 When {name} asks you to remind him about something at a specific time, include a reminder tag at the END of your response:
@@ -700,6 +705,10 @@ _WIKI_UPDATE_RE = re.compile(
     re.DOTALL,
 )
 
+_WIKI_DELETE_RE = re.compile(
+    r'<wiki_delete\s+slug="([^"]+)"\s*/?>',
+)
+
 
 def _parse_memories(text: str) -> tuple[str, list[dict]]:
     """Extract <memory> tags and return (clean_text, list_of_memories)."""
@@ -883,8 +892,21 @@ def parse_wiki_edits(text: str) -> tuple[str, list[dict]]:
         edits.append(edit)
         _pending_wiki_edits[edit_id] = edit
 
+    for m in _WIKI_DELETE_RE.finditer(text):
+        edit_id = str(uuid.uuid4())[:8]
+        edit = {
+            "id": edit_id,
+            "type": "delete",
+            "slug": m.group(1).strip(),
+            "title": None,
+            "content": "",
+        }
+        edits.append(edit)
+        _pending_wiki_edits[edit_id] = edit
+
     clean = _WIKI_CREATE_RE.sub("", text)
-    clean = _WIKI_UPDATE_RE.sub("", clean).strip()
+    clean = _WIKI_UPDATE_RE.sub("", clean)
+    clean = _WIKI_DELETE_RE.sub("", clean).strip()
     return clean, edits
 
 
