@@ -318,6 +318,21 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
 
         system = _build_system_prompt(memories, summaries, wiki_context=wiki_context)
 
+        # Detect wiki edit intent and inject hard override
+        wiki_intent = _detect_wiki_intent(user_message)
+        if wiki_intent:
+            system += (
+                f"\n\n## ⚠️ CRITICAL INSTRUCTION FOR THIS MESSAGE\n"
+                f"The user is asking to {wiki_intent} a wiki page. "
+                f"You MUST include the appropriate wiki tag in your response:\n"
+                f"- To create: <wiki_create slug=\"...\" title=\"...\">full content</wiki_create>\n"
+                f"- To update: <wiki_update slug=\"...\">full updated content</wiki_update>\n"
+                f"- To delete: <wiki_delete slug=\"...\" />\n"
+                f"Do NOT just show the content as text. The tag is REQUIRED or the edit won't be saved.\n"
+                f"In your visible response, briefly describe what you're doing — do NOT reproduce the full article content."
+            )
+            log.info(f"Wiki intent detected: {wiki_intent}")
+
         # Build the user message content (text + optional image)
         if image_data:
             user_content = []
@@ -654,6 +669,34 @@ _MEMORY_RE = re.compile(
     r'<memory\s+category="([^"]+)"\s+importance="(\d+)">(.*?)</memory>',
     re.DOTALL,
 )
+
+
+def _detect_wiki_intent(message: str) -> str | None:
+    """Detect if a message is asking to create/edit/delete a wiki page.
+    Returns the intent type or None."""
+    msg = message.lower().strip()
+
+    # Delete patterns
+    delete_words = ["delete", "remove", "destroy"]
+    wiki_words = ["wiki", "page", "article"]
+    if any(d in msg for d in delete_words) and any(w in msg for w in wiki_words):
+        return "delete"
+
+    # Create patterns
+    create_words = ["create", "new page", "new wiki", "new article", "draft a page", "write a page", "make a page"]
+    if any(c in msg for c in create_words):
+        return "create"
+
+    # Update patterns
+    update_words = ["update", "edit", "add to", "append", "modify", "change", "revise", "rewrite"]
+    if any(u in msg for u in update_words) and any(w in msg for w in wiki_words + ["the page", "that page", "this page"]):
+        return "update"
+
+    # Broader update: "add X to my Y page"
+    if "add" in msg and ("page" in msg or "wiki" in msg or "article" in msg):
+        return "update"
+
+    return None
 
 _IMAGE_RE = re.compile(
     r'<image\s+url="([^"]+)">(.*?)</image>',
