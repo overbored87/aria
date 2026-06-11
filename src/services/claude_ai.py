@@ -459,6 +459,14 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
 
         # ── Parse wiki edits (stored pending approval) ──────
         clean_text, wiki_edits = parse_wiki_edits(clean_text)
+
+        # If wiki intent was detected but Claude didn't output tags, retry with focused call
+        if wiki_intent and not wiki_edits:
+            log.info(f"Wiki intent '{wiki_intent}' detected but no tags found — retrying with focused call")
+            wiki_edits = _retry_wiki_extraction(user_message, clean_text, wiki_intent, wiki_context)
+            if wiki_edits:
+                log.info(f"Focused retry produced wiki edits: {[e['id'] for e in wiki_edits]}")
+
         if wiki_edits:
             log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
 
@@ -697,6 +705,53 @@ def _detect_wiki_intent(message: str) -> str | None:
         return "update"
 
     return None
+
+
+def _retry_wiki_extraction(user_message: str, aria_response: str, intent: str, wiki_context: str | None) -> list[dict]:
+    """Make a focused second API call to extract wiki edit tags when the first pass missed them."""
+    try:
+        tag_type = {
+            "create": '<wiki_create slug="slug-here" title="Title Here">content</wiki_create>',
+            "update": '<wiki_update slug="slug-here">full updated content</wiki_update>',
+            "delete": '<wiki_delete slug="slug-here" />',
+        }.get(intent, "")
+
+        context_block = ""
+        if wiki_context:
+            context_block = f"\n\nExisting wiki content:\n{wiki_context}"
+
+        system = (
+            "You are a structured data extractor. The user asked for a wiki edit and an AI assistant "
+            "drafted a response, but forgot to include the required XML tag. Your job is to output "
+            "ONLY the correct XML tag based on the assistant's response. No conversational text.\n\n"
+            f"Required tag format:\n{tag_type}\n\n"
+            "Rules:\n"
+            "- Output ONLY the XML tag, nothing else\n"
+            "- For updates, include the COMPLETE page content (merge existing + changes)\n"
+            "- Slugs are lowercase, hyphen-separated\n"
+            "- For deletes, just output the delete tag with the slug"
+        )
+
+        user_content = (
+            f"User's request: {user_message}\n\n"
+            f"Assistant's response (contains the intended content but no XML tag):\n{aria_response}"
+            f"{context_block}"
+        )
+
+        response = get_client().messages.create(
+            model=cfg.claude_model,
+            max_tokens=4000,
+            system=system,
+            messages=[{"role": "user", "content": user_content}],
+        )
+
+        result_text = response.content[0].text if response.content else ""
+        _, edits = parse_wiki_edits(result_text)
+        return edits
+
+    except Exception as e:
+        log.error(f"Wiki retry extraction failed: {e}")
+        return []
 
 _IMAGE_RE = re.compile(
     r'<image\s+url="([^"]+)">(.*?)</image>',
