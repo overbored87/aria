@@ -545,27 +545,25 @@ _MEMORY_RE = re.compile(
 
 def _detect_wiki_intent(message: str) -> str | None:
     """Detect if a message is asking to create/edit/delete a wiki page.
-    Returns the intent type or None."""
+    Any mention of 'wiki' with an action word triggers detection."""
     msg = message.lower().strip()
 
-    # Delete patterns
-    delete_words = ["delete", "remove", "destroy"]
-    wiki_words = ["wiki", "page", "article"]
-    if any(d in msg for d in delete_words) and any(w in msg for w in wiki_words):
+    # Must mention "wiki" somewhere
+    if "wiki" not in msg:
+        return None
+
+    # Delete
+    if any(d in msg for d in ["delete", "remove", "destroy", "get rid of"]):
         return "delete"
 
-    # Create patterns
-    create_words = ["create", "new page", "new wiki", "new article", "draft a page", "write a page", "make a page"]
-    if any(c in msg for c in create_words):
+    # Create
+    if any(c in msg for c in ["create", "new", "start", "draft", "make"]):
         return "create"
 
-    # Update patterns
-    update_words = ["update", "edit", "add to", "append", "modify", "change", "revise", "rewrite"]
-    if any(u in msg for u in update_words) and any(w in msg for w in wiki_words + ["the page", "that page", "this page"]):
-        return "update"
-
-    # Broader update: "add X to my Y page"
-    if "add" in msg and ("page" in msg or "wiki" in msg or "article" in msg):
+    # Update (default for anything else mentioning wiki + action)
+    if any(a in msg for a in ["update", "edit", "add", "append", "modify", "change",
+                                "revise", "rewrite", "include", "put", "insert",
+                                "note", "record", "save", "write", "log", "track"]):
         return "update"
 
     return None
