@@ -21,13 +21,11 @@ from src.services.database import ensure_user, save_message, get_active_memories
 from src.services.claude_ai import (
     generate_response,
     parse_images,
-    get_pending_reminders,
     get_pending_wiki_edits_from_response,
     remove_pending_wiki_edit,
 )
 from src.services import dashboard as dashboard_svc
 from src.services.summarizer import maybe_summarize
-from src.services.scheduler import schedule_reminder
 
 # Module-level pending wiki edit (only one at a time)
 _pending_wiki_edit: dict | None = None
@@ -91,8 +89,8 @@ async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/approve — Approve a pending wiki edit\n"
         "/reject — Reject a pending wiki edit\n"
         "/help — This message\n\n"
-        "Or just talk to me naturally — I handle tasks, reminders, goals, "
-        "and everything in between ✨",
+        "Or just talk to me naturally — I can search the web, "
+        "read and edit your wiki, and remember what matters ✨",
         parse_mode="Markdown",
     )
 
@@ -174,11 +172,6 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     })
     save_message(user_id, "assistant", response_text)
 
-    # Schedule any reminders that were parsed
-    reminders = get_pending_reminders()
-    for reminder in reminders:
-        schedule_reminder(user_id, reminder["dt"], reminder["message"])
-
     # Extract images, then split into message chunks
     text_without_images, images = parse_images(response_text)
     await _send_split_response(update, text_without_images, images)
@@ -236,11 +229,6 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "has_image": True,
     })
     save_message(user_id, "assistant", response_text)
-
-    # Schedule reminders
-    reminders = get_pending_reminders()
-    for reminder in reminders:
-        schedule_reminder(user_id, reminder["dt"], reminder["message"])
 
     # Send split response
     text_without_images, images = parse_images(response_text)

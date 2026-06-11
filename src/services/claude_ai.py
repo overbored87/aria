@@ -20,9 +20,6 @@ from src.services.database import (
     get_recent_summaries,
     save_memory,
     deactivate_memories_matching,
-    complete_reminders_matching,
-    cancel_reminders_matching,
-    get_upcoming_reminders,
 )
 from src.services import web_search
 from src.services import dashboard as dashboard_svc
@@ -47,9 +44,6 @@ def _build_system_prompt(
     search_results: str | None = None,
     wiki_context: str | None = None,
 ) -> str:
-    tod = time_of_day()
-    current_time = format_user_time()
-    today_str = now_user().strftime("%Y-%m-%d")
     name = cfg.user_name
 
     memory_block = ""
@@ -79,15 +73,6 @@ def _build_system_prompt(
     if search_results:
         search_block = f"\n## Web Search Results\n{search_results}"
 
-    dashboard_block = ""
-    if dashboard_svc.is_configured():
-        grouped = dashboard_svc.get_latest_by_category(limit_per_category=10)
-        if grouped:
-            dashboard_block = (
-                f"\n## {name}'s Dashboard Data (from his personal tracking system)\n"
-                + dashboard_svc.format_for_context(grouped)
-            )
-
     # Wiki: titles always loaded, content from auto-search passed in
     wiki_block = ""
     if dashboard_svc.is_configured():
@@ -100,34 +85,9 @@ def _build_system_prompt(
         if wiki_context:
             wiki_block += f"\n\n## Wiki Content (auto-loaded from matching pages)\n{wiki_context}"
 
-    # Upcoming reminders (3-day horizon)
-    reminders_block = ""
-    try:
-        upcoming = get_upcoming_reminders(cfg.allowed_user_id, horizon_days=3)
-        if upcoming:
-            rem_lines = []
-            for r in upcoming:
-                status_emoji = "🔔" if r["status"] == "active" else "⏳"
-                nudges = f" (nudged {r['nudge_count']}x)" if r.get("nudge_count", 0) > 0 else ""
-                rem_lines.append(f"  {status_emoji} {r['trigger_at'][:16]} — {r['message']}{nudges}")
-            reminders_block = f"\n## Active/Upcoming Reminders (next 3 days)\n" + "\n".join(rem_lines)
-    except Exception:
-        pass
-
     web_search_available = bool(cfg.serper_api_key)
 
-    now = now_user()
-    day_name = now.strftime("%A")  # "Saturday"
-    is_weekend = day_name in ("Saturday", "Sunday")
-    weekend_str = "It is the WEEKEND — do NOT ask about work, meetings, or productivity unless he brings it up." if is_weekend else "It is a weekday."
-
-    return f"""## ⏰ CURRENT DATE & TIME (source of truth — override everything else)
-Right now it is: {day_name}, {current_time} ({tod})
-Today's date: {today_str}
-{weekend_str}
-NEVER use timestamps from conversation history or memories as the current time. The time above is the ONLY correct time.
-
-You are Aria, {name}'s personal AI assistant on Telegram.
+    return f"""You are Aria, {name}'s personal AI assistant on Telegram.
 
 ## Your Personality
 - Competent, sharp, and genuinely invested in {name}'s success
@@ -186,56 +146,10 @@ If you need content from a specific wiki page that wasn't auto-loaded, you can s
 - If you need a specific page not auto-loaded, use <wiki_search> with short keywords
 - Summarize wiki content naturally — don't dump raw text at {name}
 
-### Creating wiki pages:
-When {name} asks you to create a new wiki page, draft it and include:
-<wiki_create slug="my-page-slug" title="My Page Title">
-Your drafted content here in plain text or markdown.
-</wiki_create>
-
-### Editing wiki pages:
-When {name} asks you to update/edit an existing wiki page, include:
-<wiki_update slug="existing-page-slug">
-The complete updated content for the page.
-</wiki_update>
-
-### Deleting wiki pages:
-When {name} asks you to delete a wiki page:
-<wiki_delete slug="existing-page-slug" />
-
-Rules for wiki edits:
-- {name} will see a truncated preview and type /approve or /reject — nothing is written without approval
-- In your visible response, briefly describe what you're creating/editing/deleting — do NOT reproduce the full content
-- Slugs should be lowercase, hyphen-separated (e.g. "ai-governance", "dating-strategy")
-- For updates, include the FULL page content (not just the changes) — it replaces the existing content
-- Check existing page slugs in the wiki titles list to avoid duplicates
-- You MUST use these tags when asked to create, edit, or delete wiki pages — do not just show content as text
-
-## Reminders
-When {name} asks you to remind him about something at a specific time, include a reminder tag at the END of your response:
-<reminder time="HH:MM" date="YYYY-MM-DD">[reminder message]</reminder>
-
-Rules for reminders:
-- time is in 24-hour format in {name}'s timezone ({cfg.user_timezone})
-- date is optional — if omitted, assumes today (or tomorrow if the time has already passed today)
-- The reminder message should be written as you'd say it to {name} — warm and personal, not robotic
-- You can set multiple reminders in one response
-- Examples of trigger phrases: "remind me to...", "set a reminder for...", "don't let me forget to...", "ping me at..."
-- Current time is {current_time} — use this to determine if a time is today or tomorrow
-- Today's date is {today_str}. ALWAYS use the correct year ({today_str[:4]}) when including dates
-- If {name} says a relative time like "in 2 hours" or "in 30 minutes", calculate the actual time
-
-## Completing / Cancelling Reminders
-Reminders will nudge {name} every 30 minutes until he acknowledges them. When he indicates a reminder is done, cancelled, or should be rescheduled:
-
-When {name} says he's done a reminded task (e.g. "done", "I did it", "taken care of"):
-<done>[keyword from the reminder message]</done>
-
-When {name} wants to cancel/stop a reminder (e.g. "stop reminding me about...", "cancel the..."):
-<cancel_reminder>[keyword from the reminder message]</cancel_reminder>
-
-When {name} wants to reschedule, use <cancel_reminder> for the old one AND <reminder> for the new time.
-
-Check the Active/Upcoming Reminders section above to match the right keyword. ALWAYS use one of these tags when {name} acknowledges or dismisses a reminder — otherwise it will keep nudging him.
+### Editing wiki:
+- When {name} asks to create, edit, or delete a wiki page, just acknowledge naturally (e.g. "I'll add that to your Daygame page")
+- The edit will be handled separately — do NOT include any XML tags, code blocks, or formatted drafts in your response
+- Do NOT mention /approve, /reject, or any approval mechanism — that's handled automatically
 
 ## Context
 - {name} is a developer based in Singapore
@@ -247,9 +161,7 @@ Check the Active/Upcoming Reminders section above to match the right keyword. AL
 {summary_block}
 {prefs_block}
 {search_block}
-{dashboard_block}
 {wiki_block}
-{reminders_block}
 
 ## Memory Extraction
 When {name} shares something important — a goal, preference, deadline, personal detail, or commitment — note it by including a <memory> tag at the END of your response (after your visible reply):
@@ -268,15 +180,6 @@ This is CRITICAL. Examples:
 - "{name} says 'I quit that job'" → <forget>works at</forget> and add a new memory with the update
 - "{name} says 'nevermind about the gym goal'" → <forget>gym</forget>
 The search term should match a keyword in the original memory content. Use the memory list above to find the right term. You can include multiple <forget> tags. ALWAYS forget before adding an updated memory — otherwise both the old and new memory will coexist and cause confusion.
-
-IMPORTANT — Time-aware memories:
-- When {name} mentions something with a time context (e.g. "I'm sleeping at 2am", "I have a meeting tomorrow at 3pm", "I went to the gym yesterday"), ALWAYS include the actual date/time in the memory content itself.
-- Use the current time ({current_time}, date: {today_str}) to calculate absolute dates. For example:
-  - "{name} says 'I slept at 2am last night'" → memory: "{name} slept at 2am on {today_str}" (or yesterday's date if it's morning)
-  - "{name} says 'meeting tomorrow at 3pm'" → memory: "Meeting scheduled for [tomorrow's date] at 3pm"
-- Each memory has a timestamp showing when it was recorded. Use this to understand the timeline:
-  - A memory timestamped 2 days ago saying "going to gym tomorrow" means he went to the gym 1 day ago
-  - Reference past events naturally: "that was yesterday", "a few days ago", "last week" — not by raw dates
 
 ## Rules
 - Never break character. You ARE Aria, not "an AI assistant"
@@ -318,20 +221,8 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
 
         system = _build_system_prompt(memories, summaries, wiki_context=wiki_context)
 
-        # Detect wiki edit intent and inject hard override
+        # Detect wiki edit intent (dedicated call will happen after main response)
         wiki_intent = _detect_wiki_intent(user_message)
-        if wiki_intent:
-            system += (
-                f"\n\n## ⚠️ CRITICAL INSTRUCTION FOR THIS MESSAGE\n"
-                f"The user is asking to {wiki_intent} a wiki page. "
-                f"You MUST include the appropriate wiki tag in your response:\n"
-                f"- To create: <wiki_create slug=\"...\" title=\"...\">full content</wiki_create>\n"
-                f"- To update: <wiki_update slug=\"...\">full updated content</wiki_update>\n"
-                f"- To delete: <wiki_delete slug=\"...\" />\n"
-                f"Do NOT just show the content as text. The tag is REQUIRED or the edit won't be saved.\n"
-                f"In your visible response, briefly describe what you're doing — do NOT reproduce the full article content."
-            )
-            log.info(f"Wiki intent detected: {wiki_intent}")
 
         # Build the user message content (text + optional image)
         if image_data:
@@ -435,44 +326,25 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
                 + ", ".join(m["category"] for m in extracted)
             )
 
-        # ── Parse reminders ──────────────────────────────────
-        clean_text, reminders = parse_reminders(clean_text)
-
-        # Schedule reminders (attach to response so handler can process)
-        if reminders:
-            clean_text = _attach_reminder_confirmations(clean_text, reminders)
-
         # ── Parse forgets ───────────────────────────────────
         clean_text, forget_terms = parse_forgets(clean_text)
         if forget_terms:
             process_forgets(user_id, forget_terms)
 
-        # ── Parse reminder completions ──────────────────────
-        clean_text, done_terms = parse_done_tags(clean_text)
-        if done_terms:
-            process_done_reminders(user_id, done_terms)
-
-        # ── Parse reminder cancellations ────────────────────
-        clean_text, cancel_terms = parse_cancel_tags(clean_text)
-        if cancel_terms:
-            process_cancel_reminders(user_id, cancel_terms)
-
-        # ── Parse wiki edits (stored pending approval) ──────
-        clean_text, wiki_edits = parse_wiki_edits(clean_text)
-
-        # If wiki intent was detected but Claude didn't output tags, retry with focused call
-        if wiki_intent and not wiki_edits:
-            log.info(f"Wiki intent '{wiki_intent}' detected but no tags found — retrying with focused call")
-            wiki_edits = _retry_wiki_extraction(user_message, clean_text, wiki_intent, wiki_context)
+        # ── Wiki edit via dedicated call (not tags) ─────────
+        wiki_edits = []
+        if wiki_intent:
+            log.info(f"Wiki intent detected: {wiki_intent} — making dedicated content call")
+            wiki_edits = _generate_wiki_content(user_message, wiki_intent, wiki_context)
             if wiki_edits:
-                log.info(f"Focused retry produced wiki edits: {[e['id'] for e in wiki_edits]}")
+                log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
 
-        if wiki_edits:
-            log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
+        # Also catch any tags Claude might have included anyway
+        clean_text, tag_edits = parse_wiki_edits(clean_text)
+        if tag_edits and not wiki_edits:
+            wiki_edits = tag_edits
 
-        # Stash reminders and wiki edits for the handler
-        _last_reminders.clear()
-        _last_reminders.extend(reminders)
+        # Stash wiki edits for the handler
         _last_wiki_edits.clear()
         _last_wiki_edits.extend(wiki_edits)
 
@@ -489,16 +361,8 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         return "Something glitched on my end. Try again?"
 
 
-# Temp storage for reminders between generate_response and handler
-_last_reminders: list[dict] = []
+# Temp storage for wiki edits between generate_response and handler
 _last_wiki_edits: list[dict] = []
-
-
-def get_pending_reminders() -> list[dict]:
-    """Pop reminders extracted from the last response."""
-    reminders = list(_last_reminders)
-    _last_reminders.clear()
-    return reminders
 
 
 def get_pending_wiki_edits_from_response() -> list[dict]:
@@ -707,36 +571,41 @@ def _detect_wiki_intent(message: str) -> str | None:
     return None
 
 
-def _retry_wiki_extraction(user_message: str, aria_response: str, intent: str, wiki_context: str | None) -> list[dict]:
-    """Make a focused second API call to extract wiki edit tags when the first pass missed them."""
-    try:
-        tag_type = {
-            "create": '<wiki_create slug="slug-here" title="Title Here">content</wiki_create>',
-            "update": '<wiki_update slug="slug-here">full updated content</wiki_update>',
-            "delete": '<wiki_delete slug="slug-here" />',
-        }.get(intent, "")
+def _generate_wiki_content(user_message: str, intent: str, wiki_context: str | None) -> list[dict]:
+    """Make a dedicated API call to generate wiki content. Returns list of edits."""
+    import json as _json
+    import uuid
 
+    try:
         context_block = ""
         if wiki_context:
-            context_block = f"\n\nExisting wiki content:\n{wiki_context}"
+            context_block = f"\n\nExisting wiki content that may be relevant:\n{wiki_context}"
 
-        system = (
-            "You are a structured data extractor. The user asked for a wiki edit and an AI assistant "
-            "drafted a response, but forgot to include the required XML tag. Your job is to output "
-            "ONLY the correct XML tag based on the assistant's response. No conversational text.\n\n"
-            f"Required tag format:\n{tag_type}\n\n"
-            "Rules:\n"
-            "- Output ONLY the XML tag, nothing else\n"
-            "- For updates, include the COMPLETE page content (merge existing + changes)\n"
-            "- Slugs are lowercase, hyphen-separated\n"
-            "- For deletes, just output the delete tag with the slug"
-        )
+        if intent == "delete":
+            system = (
+                "You are a wiki manager. The user wants to delete a page. "
+                "Based on the user's message and the available wiki pages, identify which page to delete. "
+                "Respond with ONLY a JSON object, no other text:\n"
+                '{"action": "delete", "slug": "the-page-slug", "title": "The Page Title"}'
+            )
+        elif intent == "create":
+            system = (
+                "You are a wiki content writer. The user wants to create a new wiki page. "
+                "Write the full page content based on their request. "
+                "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
+                '{"action": "create", "slug": "lowercase-hyphenated-slug", "title": "Page Title", "content": "Full page content here..."}'
+                "\n\nWrite substantial, well-structured content in markdown. The content field should be the complete page."
+            )
+        else:  # update
+            system = (
+                "You are a wiki editor. The user wants to update an existing wiki page. "
+                "Based on the existing page content and the user's request, produce the complete updated page. "
+                "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
+                '{"action": "update", "slug": "existing-page-slug", "title": "Page Title", "content": "Complete updated page content..."}'
+                "\n\nThe content field must contain the ENTIRE page (not just changes). Merge the existing content with the requested changes."
+            )
 
-        user_content = (
-            f"User's request: {user_message}\n\n"
-            f"Assistant's response (contains the intended content but no XML tag):\n{aria_response}"
-            f"{context_block}"
-        )
+        user_content = f"User's request: {user_message}{context_block}"
 
         response = get_client().messages.create(
             model=cfg.claude_model,
@@ -746,11 +615,38 @@ def _retry_wiki_extraction(user_message: str, aria_response: str, intent: str, w
         )
 
         result_text = response.content[0].text if response.content else ""
-        _, edits = parse_wiki_edits(result_text)
-        return edits
 
+        # Strip markdown fences if present
+        result_text = result_text.strip()
+        if result_text.startswith("```"):
+            result_text = result_text.split("\n", 1)[-1]
+        if result_text.endswith("```"):
+            result_text = result_text.rsplit("```", 1)[0]
+        result_text = result_text.strip()
+
+        data = _json.loads(result_text)
+
+        edit_id = str(uuid.uuid4())[:8]
+        edit = {
+            "id": edit_id,
+            "type": data.get("action", intent),
+            "slug": data.get("slug", ""),
+            "title": data.get("title"),
+            "content": data.get("content", ""),
+        }
+
+        # Store in pending edits
+        _pending_wiki_edits[edit_id] = edit
+        log.info(f"Wiki content generated: {edit['type']} {edit['slug']}")
+        return [edit]
+
+    except _json.JSONDecodeError as e:
+        log.error(f"Wiki content call returned invalid JSON: {e}")
+        # Try to extract from XML tags as fallback
+        _, tag_edits = parse_wiki_edits(result_text)
+        return tag_edits
     except Exception as e:
-        log.error(f"Wiki retry extraction failed: {e}")
+        log.error(f"Wiki content generation failed: {e}")
         return []
 
 _IMAGE_RE = re.compile(
