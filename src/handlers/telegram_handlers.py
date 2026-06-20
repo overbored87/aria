@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-from src.config import cfg
+from src.config import cfg, ALLOWED_USER_IDS
 from src.utils.logger import log
 from src.services.database import ensure_user, save_message, get_active_memories
 from src.services.claude_ai import (
@@ -52,8 +52,8 @@ def register_handlers(app: Application) -> None:
 
 
 def _is_authorized(update: Update) -> bool:
-    """Only allow the configured user."""
-    return update.effective_user and update.effective_user.id == cfg.allowed_user_id
+    """Only allow whitelisted users."""
+    return update.effective_user and update.effective_user.id in ALLOWED_USER_IDS
 
 
 # ─── Command Handlers ───────────────────────────────────────
@@ -144,7 +144,8 @@ async def _cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Process incoming text messages."""
     if not _is_authorized(update):
-        await update.message.reply_text("I'm spoken for 😏")
+        uid = update.effective_user.id if update.effective_user else "unknown"
+        await update.message.reply_text(f"I'm spoken for 😏 (your ID: {uid})")
         return
 
     user = update.effective_user
@@ -191,7 +192,8 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Process incoming photos — download, encode, send to Claude for vision."""
     if not _is_authorized(update):
-        await update.message.reply_text("I'm spoken for 😏")
+        uid = update.effective_user.id if update.effective_user else "unknown"
+        await update.message.reply_text(f"I'm spoken for 😏 (your ID: {uid})")
         return
 
     user = update.effective_user

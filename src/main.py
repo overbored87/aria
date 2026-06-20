@@ -5,7 +5,7 @@ import sys
 
 from telegram.ext import Application
 
-from src.config import cfg
+from src.config import cfg, ALLOWED_USER_IDS
 from src.utils.logger import log
 from src.handlers.telegram_handlers import register_handlers
 from src.services.scheduler import init_scheduler
@@ -23,7 +23,7 @@ def main() -> None:
         sys.exit(1)
 
     log.info(f"User timezone: {cfg.user_timezone}")
-    log.info(f"Allowed user ID: {cfg.allowed_user_id}")
+    log.info(f"Allowed user IDs: {ALLOWED_USER_IDS}")
     log.info(f"Claude model: {cfg.claude_model}")
 
     app = (

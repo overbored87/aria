@@ -335,7 +335,7 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         wiki_edits = []
         if wiki_intent:
             log.info(f"Wiki intent detected: {wiki_intent} — making dedicated content call")
-            wiki_edits = _generate_wiki_content(user_message, wiki_intent, wiki_context)
+            wiki_edits = _generate_wiki_content(user_message, wiki_intent, wiki_context, aria_response=clean_text)
             if wiki_edits:
                 log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
 
@@ -569,7 +569,7 @@ def _detect_wiki_intent(message: str) -> str | None:
     return None
 
 
-def _generate_wiki_content(user_message: str, intent: str, wiki_context: str | None) -> list[dict]:
+def _generate_wiki_content(user_message: str, intent: str, wiki_context: str | None, aria_response: str | None = None) -> list[dict]:
     """Make a dedicated API call to generate wiki content. Returns list of edits."""
     import json as _json
     import uuid
@@ -578,6 +578,8 @@ def _generate_wiki_content(user_message: str, intent: str, wiki_context: str | N
         context_block = ""
         if wiki_context:
             context_block = f"\n\nExisting wiki content that may be relevant:\n{wiki_context}"
+        if aria_response:
+            context_block += f"\n\nYour assistant already drafted this response to the user (use this as the basis for the wiki content if it contains the relevant material):\n{aria_response}"
 
         if intent == "delete":
             system = (
@@ -633,13 +635,16 @@ def _generate_wiki_content(user_message: str, intent: str, wiki_context: str | N
             "content": data.get("content", ""),
         }
 
+        if not edit["content"] and intent != "delete":
+            log.warning(f"Wiki content call returned empty content for {edit['slug']!r}; raw: {result_text[:200]}")
+
         # Store in pending edits
         _pending_wiki_edits[edit_id] = edit
         log.info(f"Wiki content generated: {edit['type']} {edit['slug']}")
         return [edit]
 
     except _json.JSONDecodeError as e:
-        log.error(f"Wiki content call returned invalid JSON: {e}")
+        log.error(f"Wiki content call returned invalid JSON: {e}; raw: {result_text[:200] if 'result_text' in dir() else '(not set)'}")
         # Try to extract from XML tags as fallback
         _, tag_edits = parse_wiki_edits(result_text)
         return tag_edits

@@ -1,7 +1,7 @@
 """Central configuration — reads env vars once, validates, exports."""
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -61,3 +61,8 @@ class Config:
 
 cfg = Config()
 
+# Allowed Telegram user IDs — includes primary + any extras from ALLOWED_USER_IDS env var.
+# Format: ALLOWED_USER_IDS=111111,222222  (comma-separated, no spaces)
+_extra_raw = os.getenv("ALLOWED_USER_IDS", "")
+_extra_ids = {int(x.strip()) for x in _extra_raw.split(",") if x.strip().isdigit()}
+ALLOWED_USER_IDS: frozenset = frozenset({cfg.allowed_user_id} | _extra_ids)
