@@ -147,7 +147,8 @@ If you need content from a specific wiki page that wasn't auto-loaded, you can s
 - Summarize wiki content naturally — don't dump raw text at {name}
 
 ### Editing wiki:
-- When {name} asks to create, edit, or delete a wiki page, just acknowledge naturally (e.g. "I'll add that to your Daygame page")
+- When {name} asks to create, edit, or delete a wiki page — including via a screenshot or image — just acknowledge naturally (e.g. "I'll update your Contacts page with this")
+- If given an image with instructions to update a page, extract the relevant information from the image and describe what you're adding in your acknowledgement
 - The edit will be handled separately — do NOT include any XML tags, code blocks, or formatted drafts in your response
 - Do NOT mention /approve, /reject, or any approval mechanism — that's handled automatically
 
@@ -222,7 +223,7 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         system = _build_system_prompt(memories, summaries, wiki_context=wiki_context)
 
         # Detect wiki edit intent (dedicated call will happen after main response)
-        wiki_intent = _detect_wiki_intent(user_message)
+        wiki_intent = _detect_wiki_intent(user_message, has_image=image_data is not None)
 
         # Build the user message content (text + optional image)
         if image_data:
@@ -543,28 +544,24 @@ _MEMORY_RE = re.compile(
 )
 
 
-def _detect_wiki_intent(message: str) -> str | None:
+def _detect_wiki_intent(message: str, has_image: bool = False) -> str | None:
     """Detect if a message is asking to create/edit/delete a wiki page.
-    Any mention of 'wiki' with an action word triggers detection."""
+    Requires 'wiki' in text messages; for images, action words alone are enough."""
     msg = message.lower().strip()
-
-    # Must mention "wiki" somewhere
-    if "wiki" not in msg:
-        return None
 
     # Delete
     if any(d in msg for d in ["delete", "remove", "destroy", "get rid of"]):
-        return "delete"
+        return "delete" if ("wiki" in msg or has_image) else None
 
     # Create
     if any(c in msg for c in ["create", "new", "start", "draft", "make"]):
-        return "create"
+        return "create" if ("wiki" in msg or has_image) else None
 
-    # Update (default for anything else mentioning wiki + action)
+    # Update
     if any(a in msg for a in ["update", "edit", "add", "append", "modify", "change",
                                 "revise", "rewrite", "include", "put", "insert",
                                 "note", "record", "save", "write", "log", "track"]):
-        return "update"
+        return "update" if ("wiki" in msg or has_image) else None
 
     return None
 
