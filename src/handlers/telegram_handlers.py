@@ -367,30 +367,17 @@ async def _send_split_response(
     text: str,
     images: list[dict] | None = None,
 ) -> None:
-    """Split response on double newlines and send as separate Telegram messages.
-    Images are sent at the end (or inline if we can match position later)."""
+    """Send response as a single message, followed by any images."""
     chat = update.effective_chat
 
-    # Split on double newlines (blank lines) — each chunk becomes a message
-    chunks = [c.strip() for c in re.split(r"\n\n+", text) if c.strip()]
-
-    if not chunks and not images:
-        return
-
-    for i, chunk in enumerate(chunks):
-        # Small delay between messages for natural feel (skip first)
-        if i > 0:
-            await asyncio.sleep(0.4)
-            await chat.send_action("typing")
-            await asyncio.sleep(0.3)
-
+    if text.strip():
         try:
-            await chat.send_message(chunk, parse_mode="Markdown")
+            await chat.send_message(text.strip(), parse_mode="Markdown")
         except Exception:
             try:
-                await chat.send_message(chunk)
+                await chat.send_message(text.strip())
             except Exception as e:
-                log.error(f"Failed to send chunk {i}: {e}")
+                log.error(f"Failed to send message: {e}")
 
     # Send any images
     for img in (images or []):
