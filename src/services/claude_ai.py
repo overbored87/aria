@@ -122,8 +122,10 @@ To load a specific page: <wiki_search>keyword</wiki_search>
 
 ### Wiki style (Karpathy-style):
 - Dense and factual — no filler, no prose padding
+- Most pages are just a few lines. A paragraph at most
 - Use short lines, minimal markdown, only structure what earns it
 - Capture the signal, drop the noise
+- Do NOT write essays or long articles. If in doubt, write less
 
 ### Reading wiki:
 - Check the auto-loaded "Wiki Content" section before searching manually
