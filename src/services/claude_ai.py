@@ -563,7 +563,7 @@ def _wiki_writer_call(
 
         response = get_client().messages.create(
             model=cfg.claude_model,
-            max_tokens=1024,
+            max_tokens=2048,
             system=system,
             messages=[{"role": "user", "content": user_parts}],
         )
