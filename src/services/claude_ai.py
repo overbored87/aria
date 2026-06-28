@@ -78,7 +78,8 @@ You have tools available. Use them proactively:
 - After proposing a wiki edit, reply with one sentence describing what you drafted. Do NOT mention /approve or /reject.
 
 ## Wiki Style (for all wiki content you write)
-Karpathy style: dense, factual, max 400 words. Use `##` headers for 3+ distinct sections, bullets for lists, bold for key terms. Start directly with content — no intro sentence, no "this page covers...". For updates: preserve existing structure, only change what's new.
+Karpathy style: dense, factual, no filler. Start directly with content — no intro sentence, no "this page covers...". Use `##` headers for 3+ distinct sections, bullets for lists, bold for key terms. For updates: preserve existing structure, only change what's new.
+Default length: under 400 words. Write longer only if the user explicitly asks for a detailed or comprehensive article.
 
 ## Memory
 When {name} shares something worth keeping, append to your response:
@@ -127,9 +128,9 @@ _TOOLS = [
         "name": "propose_wiki_create",
         "description": (
             "Propose creating a new wiki page for user approval. "
-            "STRICT: content must be under 400 words. Karpathy style — dense, factual, "
-            "no intro sentence, no filler. ## headers only for 3+ sections. "
-            "Bullets for lists. Bold key terms."
+            "Default: concise, under 400 words, Karpathy style — dense, factual, no intro sentence, no filler. "
+            "## headers only for 3+ sections. Bullets for lists. Bold key terms. "
+            "Write longer only if the user explicitly asks for a detailed or comprehensive article."
         ),
         "input_schema": {
             "type": "object",
@@ -198,10 +199,6 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
 
         elif name == "propose_wiki_create":
             content = tool_input["content"]
-            words = content.split()
-            if len(words) > 400:
-                log.warning(f"Wiki create truncated from {len(words)} to 400 words: {tool_input['slug']}")
-                content = " ".join(words[:400])
             edit_id = str(uuid.uuid4())[:8]
             edit = {
                 "id": edit_id,
@@ -218,10 +215,6 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
 
         elif name == "propose_wiki_update":
             content = tool_input["content"]
-            words = content.split()
-            if len(words) > 400:
-                log.warning(f"Wiki update truncated from {len(words)} to 400 words: {tool_input['slug']}")
-                content = " ".join(words[:400])
             edit_id = str(uuid.uuid4())[:8]
             edit = {
                 "id": edit_id,
