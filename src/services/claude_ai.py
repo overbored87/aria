@@ -286,6 +286,11 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         if tag_edits and not wiki_edits:
             wiki_edits = tag_edits
 
+        # If wiki edits are pending, enforce one-sentence reply
+        if wiki_edits:
+            first_sentence = re.split(r'(?<=[.!?])\s', clean_text.strip(), maxsplit=1)[0]
+            clean_text = first_sentence
+
         # Stash wiki edits for the handler
         _last_wiki_edits.clear()
         _last_wiki_edits.extend(wiki_edits)
