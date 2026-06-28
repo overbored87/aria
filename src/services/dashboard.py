@@ -362,21 +362,21 @@ def _markdown_to_html(text: str) -> str:
 
 
 def create_wiki_page(user_id: int, title: str, slug: str, content: str) -> dict | None:
-    """Create a new wiki page."""
+    """Create a new wiki page, or update it if the slug already exists."""
     db = _get_dashboard_db()
     if not db:
         return None
 
     try:
-        result = db.table("wiki_pages").insert({
+        result = db.table("wiki_pages").upsert({
             "user_id": user_id,
             "title": title,
             "slug": slug,
             "content": content,
             "content_rendered": _markdown_to_html(content),
-        }).execute()
+        }, on_conflict="slug").execute()
         if result.data:
-            log.info(f"Wiki page created: {title} ({slug})")
+            log.info(f"Wiki page upserted: {title} ({slug})")
             return result.data[0]
         return None
     except Exception as e:

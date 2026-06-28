@@ -310,10 +310,17 @@ async def _cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if edit["type"] == "create":
         result = dashboard_svc.create_wiki_page(
             user_id=user_id,
-            title=edit["title"],
+            title=edit.get("title") or edit["slug"],
             slug=edit["slug"],
             content=edit["content"],
         )
+        if result is None:
+            # Upsert failed — try plain update
+            result = dashboard_svc.update_wiki_page(
+                slug=edit["slug"],
+                content=edit["content"],
+                title=edit.get("title"),
+            )
         success = result is not None
 
     elif edit["type"] == "update":
