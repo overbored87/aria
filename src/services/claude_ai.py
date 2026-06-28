@@ -529,10 +529,19 @@ def _wiki_writer_call(
 
         context_block = ("\n\n" + "\n\n".join(context_parts)) if context_parts else ""
 
-        STYLE = (
-            "Karpathy style: dense, factual, no filler. "
-            "Use markdown formatting — ## headers to separate distinct sections, bullet points for lists, bold for key terms. "
-            "Keep it concise: a few lines per section, no padding. Think a well-structured reference card, not an essay."
+        CREATE_STYLE = (
+            "Karpathy style. Max 400 words. "
+            "Use ## headers only if there are 3+ distinct sections. "
+            "Bullet points for lists, bold for key terms. "
+            "Every sentence must earn its place — no intro, no summary, no 'this page covers...'. "
+            "Start directly with the content."
+        )
+        EDIT_STYLE = (
+            "You are merging new information into an existing wiki page. "
+            "Preserve all existing content that is still accurate. "
+            "Add or update only what has changed — do not rewrite for style. "
+            "Keep the same structure unless restructuring genuinely improves it. "
+            "Max 400 words total. No filler, no commentary about what changed."
         )
         if intent == "delete":
             system = (
@@ -542,13 +551,13 @@ def _wiki_writer_call(
             )
         elif intent == "create":
             system = (
-                f"Write a concise wiki page. {STYLE}\n"
+                f"Write a concise wiki page. {CREATE_STYLE}\n"
                 "Output ONLY this tag, nothing else:\n"
                 '<wiki_create slug="lowercase-slug" title="Page Title">content</wiki_create>'
             )
         else:
             system = (
-                f"Update this wiki page by merging existing content with the new information. {STYLE}\n"
+                f"{EDIT_STYLE}\n"
                 "Output the full updated page. Output ONLY this tag, nothing else:\n"
                 '<wiki_update slug="existing-slug">full updated content</wiki_update>'
             )
