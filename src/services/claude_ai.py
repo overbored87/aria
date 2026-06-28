@@ -37,12 +37,7 @@ def get_client() -> anthropic.Anthropic:
 # ─── System Prompt Builder ──────────────────────────────────
 
 
-def _build_system_prompt(
-    memories: list[dict],
-    summaries: list[dict],
-    search_results: str | None = None,
-    wiki_context: str | None = None,
-) -> str:
+def _build_system_prompt(memories: list[dict], summaries: list[dict]) -> str:
     name = cfg.user_name
 
     memory_block = ""
@@ -51,35 +46,23 @@ def _build_system_prompt(
         for m in memories:
             ts = utc_to_user(m["created_at"]) if m.get("created_at") else ""
             mem_lines.append(f"- [{m['category']}] ({ts}) {m['content']}")
-        memory_block = "\n".join(mem_lines)
+        memory_block = "## Memories\n" + "\n".join(mem_lines)
     else:
-        memory_block = "No stored memories yet — getting to know him."
+        memory_block = "## Memories\nNone yet."
 
     summary_block = ""
     if summaries:
-        lines = []
-        for s in summaries:
-            end = s.get("period_end", "")[:10]
-            lines.append(f"- ({end}): {s['summary']}")
-        summary_block = f"\n## Recent Conversation Summaries\n" + "\n".join(lines)
+        lines = [f"- ({s.get('period_end','')[:10]}): {s['summary']}" for s in summaries]
+        summary_block = "## Recent Summaries\n" + "\n".join(lines)
 
-    search_block = ""
-    if search_results:
-        search_block = f"\n## Web Search Results\n{search_results}"
-
-    # Wiki: titles always loaded, content from auto-search passed in
     wiki_block = ""
     if dashboard_svc.is_configured():
         wiki_titles = dashboard_svc.get_wiki_titles()
         if wiki_titles:
             wiki_block = (
-                f"\n## {name}'s Wiki Pages\n"
+                f"## {name}'s Wiki Pages\n"
                 + dashboard_svc.format_wiki_titles_for_context(wiki_titles)
             )
-        if wiki_context:
-            wiki_block += f"\n\n## Wiki Content (auto-loaded from matching pages)\n{wiki_context}"
-
-    web_search_available = bool(cfg.serper_api_key)
 
     return f"""You are Aria, {name}'s personal assistant and wiki specialist on Telegram.
 
@@ -87,211 +70,285 @@ def _build_system_prompt(
 
 **Replies:** one short message, a sentence or two. Never more than a short paragraph unless asked. Telegram markdown only (`*bold*`, `_italic_`, `` `code` ``).
 
----
+## Tools
+You have tools available. Use them proactively:
+- **Wiki reads:** always call `read_wiki_page` before updating a page — never assume content
+- **Wiki writes:** use `propose_wiki_create` or `propose_wiki_update` — the user approves before saving
+- **Web search:** call `web_search` when you need current info or facts you're unsure of
+- After proposing a wiki edit, reply with one sentence describing what you drafted. Do NOT mention /approve or /reject.
 
-## Wiki
+## Wiki Style (for all wiki content you write)
+Karpathy style: dense, factual, max 400 words. Use `##` headers for 3+ distinct sections, bullets for lists, bold for key terms. Start directly with content — no intro sentence, no "this page covers...". For updates: preserve existing structure, only change what's new.
 
-{name}'s wiki page titles and any relevant content are loaded below.
-To load a specific page: `<wiki_search>keyword</wiki_search>`
-When reading: summarise naturally, don't dump raw text.
-
-When {name} asks to create or update a wiki page, reply with ONE short sentence describing what you're capturing — e.g. "Adding a RAG page covering retrieval pipeline and chunking strategies." The actual draft is handled separately. Do NOT write the content yourself. Do NOT mention /approve or /reject.
-
----
-
-## Web Search
-{"Place `<search>query</search>` BEFORE your response. Also `<image_search>query</image_search>` for images." if web_search_available else "Web search not configured."}
+## Memory
+When {name} shares something worth keeping, append to your response:
+`<memory category="personal|preference|goal|task|relationship|habit|work|health|interest|other" importance="1-10">fact</memory>`
+When resolved: `<forget>keyword</forget>` — always forget before adding an update.
 
 ## Images
 `<image url="https://...">caption</image>` — direct URLs only, use sparingly.
 
----
-
-## Memory
-Append to response when {name} shares something worth keeping:
-`<memory category="personal|preference|goal|task|relationship|habit|work|health|interest|other" importance="1-10">fact</memory>`
-When resolved: `<forget>keyword</forget>` — always forget before adding an update.
-
----
-
 ## Context
 - {name}: developer, Singapore. Productivity tools, games, minimalist design
 - Dashboard: finances, dating pipeline, todos (Telegram + Supabase + React)
+- Current time: {format_user_time()}
 
 ---
 
 {wiki_block}
+
 {memory_block}
-{summary_block}
-{search_block}
-"""
+
+{summary_block}"""
+
+
+# ─── Tool Definitions ───────────────────────────────────────
+
+_TOOLS = [
+    {
+        "name": "search_wiki",
+        "description": "Search wiki pages by keyword. Use to find relevant pages before reading or editing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "read_wiki_page",
+        "description": "Read the full content of a wiki page by slug. Always call this before proposing an update.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"slug": {"type": "string"}},
+            "required": ["slug"],
+        },
+    },
+    {
+        "name": "propose_wiki_create",
+        "description": (
+            "Propose creating a new wiki page for user approval. "
+            "Content: Karpathy style, max 400 words, ## headers for 3+ sections, "
+            "bullets for lists, bold key terms. No intro sentence."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "description": "lowercase-hyphenated-slug"},
+                "title": {"type": "string"},
+                "content": {"type": "string", "description": "Full page content in markdown"},
+            },
+            "required": ["slug", "title", "content"],
+        },
+    },
+    {
+        "name": "propose_wiki_update",
+        "description": (
+            "Propose updating an existing wiki page for user approval. "
+            "Read the page first. Merge existing + new — preserve accurate content, update only what changed. "
+            "Output the full page. Max 400 words."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string"},
+                "title": {"type": "string"},
+                "content": {"type": "string", "description": "Complete updated page content"},
+            },
+            "required": ["slug", "content"],
+        },
+    },
+    {
+        "name": "propose_wiki_delete",
+        "description": "Propose deleting a wiki page for user approval.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"slug": {"type": "string"}},
+            "required": ["slug"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": "Search the web for current information, news, or facts you're unsure about.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+]
+
+
+def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
+    import uuid
+    try:
+        if name == "search_wiki":
+            if not dashboard_svc.is_configured():
+                return "Wiki not configured."
+            pages = dashboard_svc.search_wiki(tool_input["query"])
+            return dashboard_svc.format_wiki_results_for_context(pages) or "No results found."
+
+        elif name == "read_wiki_page":
+            if not dashboard_svc.is_configured():
+                return "Wiki not configured."
+            page = dashboard_svc.get_wiki_page(tool_input["slug"])
+            if page:
+                return f"**{page['title']}**\n\n{page['content']}"
+            return f"Page '{tool_input['slug']}' not found."
+
+        elif name == "propose_wiki_create":
+            edit_id = str(uuid.uuid4())[:8]
+            edit = {
+                "id": edit_id,
+                "type": "create",
+                "slug": tool_input["slug"],
+                "title": tool_input["title"],
+                "content": tool_input["content"],
+                "description": "",
+            }
+            _pending_wiki_edits[edit_id] = edit
+            wiki_edits.append(edit)
+            log.info(f"Wiki create proposed: {tool_input['slug']}")
+            return f"Queued for approval: '{tool_input['title']}'"
+
+        elif name == "propose_wiki_update":
+            edit_id = str(uuid.uuid4())[:8]
+            edit = {
+                "id": edit_id,
+                "type": "update",
+                "slug": tool_input["slug"],
+                "title": tool_input.get("title"),
+                "content": tool_input["content"],
+                "description": "",
+            }
+            _pending_wiki_edits[edit_id] = edit
+            wiki_edits.append(edit)
+            log.info(f"Wiki update proposed: {tool_input['slug']}")
+            return f"Update queued for approval: '{tool_input['slug']}'"
+
+        elif name == "propose_wiki_delete":
+            edit_id = str(uuid.uuid4())[:8]
+            edit = {
+                "id": edit_id,
+                "type": "delete",
+                "slug": tool_input["slug"],
+                "title": None,
+                "content": "",
+                "description": "",
+            }
+            _pending_wiki_edits[edit_id] = edit
+            wiki_edits.append(edit)
+            log.info(f"Wiki delete proposed: {tool_input['slug']}")
+            return f"Delete queued for approval: '{tool_input['slug']}'"
+
+        elif name == "web_search":
+            if not cfg.serper_api_key:
+                return "Web search not configured."
+            results = web_search.search(tool_input["query"])
+            return web_search.format_results_for_context(results)
+
+        return f"Unknown tool: {name}"
+
+    except Exception as e:
+        log.error(f"Tool execution failed ({name}): {e}")
+        return f"Error: {e}"
 
 
 # ─── Response Generation ────────────────────────────────────
 
 
 def generate_response(user_id: int, user_message: str, image_data: dict | None = None) -> str:
-    """Generate Aria's response with search, reminder, and vision support.
-
-    Args:
-        user_id: Telegram user ID
-        user_message: Text content of the message
-        image_data: Optional dict with {"base64": str, "media_type": str} for image vision
-
-    Flow:
-    1. First pass: ask Claude to respond (may include <search> tags)
-    2. If search tags found: execute searches, re-call Claude with results
-    3. Parse out <memory>, <reminder>, <image>, <search> tags from final response
-    """
+    """Generate Aria's response using an agentic tool loop."""
     try:
         memories = get_active_memories(user_id)
         summaries = get_recent_summaries(user_id, 3)
         history = get_recent_conversation(user_id)
+        system = _build_system_prompt(memories, summaries)
 
-        # Auto-search wiki based on user message keywords
-        wiki_context = None
-        if dashboard_svc.is_configured() and user_message:
-            auto_wiki_pages = dashboard_svc.auto_search_wiki(user_message, max_results=3)
-            if auto_wiki_pages:
-                wiki_context = dashboard_svc.format_wiki_results_for_context(auto_wiki_pages)
-                log.info(f"Wiki auto-search found {len(auto_wiki_pages)} pages: {[p['title'] for p in auto_wiki_pages]}")
-
-        wiki_intent = _detect_wiki_intent(user_message, has_image=image_data is not None)
-        system = _build_system_prompt(memories, summaries, wiki_context=wiki_context)
-
-        # Build the user message content (text + optional image)
         if image_data:
-            user_content = []
-            user_content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": image_data["media_type"],
-                    "data": image_data["base64"],
+            user_content = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image_data["media_type"],
+                        "data": image_data["base64"],
+                    },
                 },
-            })
-            if user_message:
-                user_content.append({"type": "text", "text": user_message})
-            else:
-                user_content.append({"type": "text", "text": "What do you see in this image?"})
-            messages = history + [{"role": "user", "content": user_content}]
+                {"type": "text", "text": user_message or "What do you see in this image?"},
+            ]
         else:
-            messages = history + [{"role": "user", "content": user_message}]
+            user_content = user_message
+
+        messages = history + [{"role": "user", "content": user_content}]
 
         log.info(
             f"Calling Claude: {len(history)} history msgs, {len(memories)} memories, "
-            f"time={format_user_time()}, has_image={image_data is not None}"
+            f"has_image={image_data is not None}"
         )
 
-        response = get_client().messages.create(
-            model=cfg.claude_model,
-            max_tokens=cfg.max_tokens,
-            system=system,
-            messages=messages,
-        )
+        # ── Agentic tool loop ─────────────────────────────────
+        wiki_edits: list[dict] = []
+        final_text = ""
 
-        full_text = "".join(
-            block.text for block in response.content if block.type == "text"
-        )
-
-        # ── Check for search requests ────────────────────────
-        search_queries = _SEARCH_RE.findall(full_text)
-        image_search_queries = _IMAGE_SEARCH_RE.findall(full_text)
-        wiki_search_queries = _WIKI_SEARCH_RE.findall(full_text)
-
-        if search_queries or image_search_queries or wiki_search_queries:
-            # Execute searches
-            search_results_text = ""
-            if search_queries:
-                for query in search_queries:
-                    results = web_search.search(query.strip())
-                    search_results_text += f"\n### Results for: {query.strip()}\n"
-                    search_results_text += web_search.format_results_for_context(results)
-
-            image_results = []
-            if image_search_queries:
-                for query in image_search_queries:
-                    imgs = web_search.search_images(query.strip(), num_results=3)
-                    if imgs:
-                        image_results.extend(imgs)
-                        search_results_text += f"\n### Image results for: {query.strip()}\n"
-                        for img in imgs:
-                            search_results_text += f"- {img['title']}: {img['image_url']}\n"
-
-            # Execute wiki searches
-            wiki_results_text = ""
-            if wiki_search_queries:
-                for query in wiki_search_queries:
-                    pages = dashboard_svc.search_wiki(query.strip())
-                    wiki_results_text += f"\n### Wiki results for: {query.strip()}\n"
-                    wiki_results_text += dashboard_svc.format_wiki_results_for_context(pages)
-                if wiki_results_text:
-                    search_results_text += f"\n## Wiki Content\n{wiki_results_text}"
-
-            # Second pass with search results
-            system_with_search = _build_system_prompt(
-                memories, summaries, search_results=search_results_text, wiki_context=wiki_context
-            )
-
-            response2 = get_client().messages.create(
+        for iteration in range(6):
+            response = get_client().messages.create(
                 model=cfg.claude_model,
                 max_tokens=cfg.max_tokens,
-                system=system_with_search,
+                system=system,
+                tools=_TOOLS,
                 messages=messages,
             )
 
-            full_text = "".join(
-                block.text for block in response2.content if block.type == "text"
-            )
+            text_parts = [b.text for b in response.content if b.type == "text"]
+            if text_parts:
+                final_text = "\n".join(text_parts)
 
-        # ── Strip search tags from final output ──────────────
-        full_text = _SEARCH_RE.sub("", full_text)
-        full_text = _IMAGE_SEARCH_RE.sub("", full_text)
-        full_text = _WIKI_SEARCH_RE.sub("", full_text)
+            if response.stop_reason == "end_turn":
+                break
 
-        # ── Parse memories ───────────────────────────────────
-        clean_text, extracted = _parse_memories(full_text)
+            if response.stop_reason == "tool_use":
+                tool_uses = [b for b in response.content if b.type == "tool_use"]
+                tool_results = []
+                for tu in tool_uses:
+                    log.info(f"Tool: {tu.name}({list(tu.input.keys())})")
+                    result = _execute_tool(tu.name, tu.input, wiki_edits)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": result,
+                    })
+                messages = messages + [
+                    {"role": "assistant", "content": response.content},
+                    {"role": "user", "content": tool_results},
+                ]
+            else:
+                break
 
+        # ── Parse tags from final text ────────────────────────
+        clean_text, extracted = _parse_memories(final_text)
         for mem in extracted:
             save_memory(user_id, mem["category"], mem["content"], mem["importance"])
-
         if extracted:
-            log.info(
-                f"Extracted {len(extracted)} memories: "
-                + ", ".join(m["category"] for m in extracted)
-            )
+            log.info(f"Extracted {len(extracted)} memories: {[m['category'] for m in extracted]}")
 
-        # ── Parse forgets ───────────────────────────────────
         clean_text, forget_terms = parse_forgets(clean_text)
         if forget_terms:
             process_forgets(user_id, forget_terms)
 
-        # ── Wiki edits — dedicated writer call ───────────────
-        wiki_edits = []
-        if wiki_intent:
-            log.info(f"Wiki intent detected ({wiki_intent}) — calling wiki writer")
-            # For updates, try to load the full target page if not already in context
-            full_wiki_context = wiki_context
-            if wiki_intent == "update" and dashboard_svc.is_configured():
-                extra = dashboard_svc.auto_search_wiki(user_message, max_results=1)
-                if extra:
-                    extra_text = dashboard_svc.format_wiki_results_for_context(extra)
-                    full_wiki_context = (wiki_context or "") + "\n" + extra_text
-            wiki_edits = _wiki_writer_call(user_message, wiki_intent, full_wiki_context, aria_reply=clean_text, image_data=image_data)
-            if wiki_edits:
-                log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
-
-        # Also catch any tags Aria may have included anyway
+        # Fallback: catch any wiki tags Aria wrote directly
         clean_text, tag_edits = parse_wiki_edits(clean_text)
         if tag_edits and not wiki_edits:
             wiki_edits = tag_edits
 
-        # If wiki edits are pending, enforce one-sentence reply
+        # Enforce one-sentence reply when wiki edits are pending
         if wiki_edits:
-            first_sentence = re.split(r'(?<=[.!?])\s', clean_text.strip(), maxsplit=1)[0]
-            clean_text = first_sentence
+            for edit in wiki_edits:
+                edit["description"] = clean_text.strip()
+            clean_text = re.split(r'(?<=[.!?])\s', clean_text.strip(), maxsplit=1)[0]
 
-        # Stash wiki edits for the handler
+        if wiki_edits:
+            log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
+
         _last_wiki_edits.clear()
         _last_wiki_edits.extend(wiki_edits)
 
