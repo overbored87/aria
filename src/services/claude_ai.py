@@ -127,8 +127,9 @@ _TOOLS = [
         "name": "propose_wiki_create",
         "description": (
             "Propose creating a new wiki page for user approval. "
-            "Content: Karpathy style, max 400 words, ## headers for 3+ sections, "
-            "bullets for lists, bold key terms. No intro sentence."
+            "STRICT: content must be under 400 words. Karpathy style — dense, factual, "
+            "no intro sentence, no filler. ## headers only for 3+ sections. "
+            "Bullets for lists. Bold key terms."
         ),
         "input_schema": {
             "type": "object",
@@ -144,8 +145,8 @@ _TOOLS = [
         "name": "propose_wiki_update",
         "description": (
             "Propose updating an existing wiki page for user approval. "
-            "Read the page first. Merge existing + new — preserve accurate content, update only what changed. "
-            "Output the full page. Max 400 words."
+            "Always read the page first. Merge existing + new info — preserve accurate content, "
+            "update only what changed. Output the FULL updated page. STRICT: max 400 words total."
         ),
         "input_schema": {
             "type": "object",
@@ -196,33 +197,43 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
             return f"Page '{tool_input['slug']}' not found."
 
         elif name == "propose_wiki_create":
+            content = tool_input["content"]
+            words = content.split()
+            if len(words) > 400:
+                log.warning(f"Wiki create truncated from {len(words)} to 400 words: {tool_input['slug']}")
+                content = " ".join(words[:400])
             edit_id = str(uuid.uuid4())[:8]
             edit = {
                 "id": edit_id,
                 "type": "create",
                 "slug": tool_input["slug"],
                 "title": tool_input["title"],
-                "content": tool_input["content"],
+                "content": content,
                 "description": "",
             }
             _pending_wiki_edits[edit_id] = edit
             wiki_edits.append(edit)
-            log.info(f"Wiki create proposed: {tool_input['slug']}")
+            log.info(f"Wiki create proposed: {tool_input['slug']} ({len(content.split())} words)")
             return f"Queued for approval: '{tool_input['title']}'"
 
         elif name == "propose_wiki_update":
+            content = tool_input["content"]
+            words = content.split()
+            if len(words) > 400:
+                log.warning(f"Wiki update truncated from {len(words)} to 400 words: {tool_input['slug']}")
+                content = " ".join(words[:400])
             edit_id = str(uuid.uuid4())[:8]
             edit = {
                 "id": edit_id,
                 "type": "update",
                 "slug": tool_input["slug"],
                 "title": tool_input.get("title"),
-                "content": tool_input["content"],
+                "content": content,
                 "description": "",
             }
             _pending_wiki_edits[edit_id] = edit
             wiki_edits.append(edit)
-            log.info(f"Wiki update proposed: {tool_input['slug']}")
+            log.info(f"Wiki update proposed: {tool_input['slug']} ({len(content.split())} words)")
             return f"Update queued for approval: '{tool_input['slug']}'"
 
         elif name == "propose_wiki_delete":
