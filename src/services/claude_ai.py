@@ -40,7 +40,6 @@ def get_client() -> anthropic.Anthropic:
 def _build_system_prompt(
     memories: list[dict],
     summaries: list[dict],
-    user_preferences: dict | None = None,
     search_results: str | None = None,
     wiki_context: str | None = None,
 ) -> str:
@@ -63,11 +62,6 @@ def _build_system_prompt(
             end = s.get("period_end", "")[:10]
             lines.append(f"- ({end}): {s['summary']}")
         summary_block = f"\n## Recent Conversation Summaries\n" + "\n".join(lines)
-
-    prefs_block = ""
-    if user_preferences:
-        lines = [f"- {k}: {v}" for k, v in user_preferences.items()]
-        prefs_block = f"\n## {name}'s Preferences\n" + "\n".join(lines)
 
     search_block = ""
     if search_results:
@@ -129,7 +123,8 @@ When resolved: `<forget>keyword</forget>` — always forget before adding an upd
 {wiki_block}
 {memory_block}
 {summary_block}
-{search_block}"""
+{search_block}
+"""
 
 
 # ─── Response Generation ────────────────────────────────────
@@ -161,10 +156,8 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
                 wiki_context = dashboard_svc.format_wiki_results_for_context(auto_wiki_pages)
                 log.info(f"Wiki auto-search found {len(auto_wiki_pages)} pages: {[p['title'] for p in auto_wiki_pages]}")
 
-        system = _build_system_prompt(memories, summaries, wiki_context=wiki_context)
-
-        # Detect wiki edit intent (dedicated call will happen after main response)
         wiki_intent = _detect_wiki_intent(user_message, has_image=image_data is not None)
+        system = _build_system_prompt(memories, summaries, wiki_context=wiki_context)
 
         # Build the user message content (text + optional image)
         if image_data:
@@ -274,11 +267,17 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
             process_forgets(user_id, forget_terms)
 
         # ── Wiki edits — dedicated writer call ───────────────
-        wiki_intent = _detect_wiki_intent(user_message, has_image=image_data is not None)
         wiki_edits = []
         if wiki_intent:
             log.info(f"Wiki intent detected ({wiki_intent}) — calling wiki writer")
-            wiki_edits = _wiki_writer_call(user_message, wiki_intent, wiki_context, aria_reply=clean_text, image_data=image_data)
+            # For updates, try to load the full target page if not already in context
+            full_wiki_context = wiki_context
+            if wiki_intent == "update" and dashboard_svc.is_configured():
+                extra = dashboard_svc.auto_search_wiki(user_message, max_results=1)
+                if extra:
+                    extra_text = dashboard_svc.format_wiki_results_for_context(extra)
+                    full_wiki_context = (wiki_context or "") + "\n" + extra_text
+            wiki_edits = _wiki_writer_call(user_message, wiki_intent, full_wiki_context, aria_reply=clean_text, image_data=image_data)
             if wiki_edits:
                 log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
 
@@ -525,23 +524,26 @@ def _wiki_writer_call(
 
         context_block = ("\n\n" + "\n\n".join(context_parts)) if context_parts else ""
 
+        STYLE = (
+            "Karpathy style: dense, factual, no filler. "
+            "Under 80 words. Bullet points only if genuinely list-like. No headers unless the page has multiple distinct sections."
+        )
         if intent == "delete":
             system = (
-                "You are a wiki manager. Identify which page to delete based on the user's request and available pages.\n"
+                "Identify which wiki page to delete based on the user's request.\n"
                 "Output ONLY this tag, nothing else:\n"
                 '<wiki_delete slug="the-page-slug" />'
             )
         elif intent == "create":
             system = (
-                "You are a wiki writer. Write a concise, factual wiki page in Karpathy style — dense, no fluff, a short paragraph at most.\n"
+                f"Write a concise wiki page. {STYLE}\n"
                 "Output ONLY this tag, nothing else:\n"
                 '<wiki_create slug="lowercase-slug" title="Page Title">content</wiki_create>'
             )
         else:
             system = (
-                "You are a wiki editor. Produce the complete updated page by merging existing content with the new information. "
-                "Karpathy style: dense, factual, a short paragraph at most.\n"
-                "Output ONLY this tag, nothing else:\n"
+                f"Update this wiki page by merging existing content with the new information. {STYLE}\n"
+                "Output the full updated page. Output ONLY this tag, nothing else:\n"
                 '<wiki_update slug="existing-slug">full updated content</wiki_update>'
             )
 
