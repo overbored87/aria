@@ -568,6 +568,9 @@ def _wiki_writer_call(
         _, edits = parse_wiki_edits(result_text)
         if not edits:
             log.warning(f"Wiki writer returned no parseable tags; raw: {result_text[:200]}")
+        # Attach Aria's conversational summary as the description
+        for edit in edits:
+            edit["description"] = aria_reply or ""
         return edits
 
     except Exception as e:

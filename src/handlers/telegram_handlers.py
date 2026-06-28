@@ -269,9 +269,11 @@ async def _send_wiki_preview(chat, edit: dict) -> None:
             )
         else:
             word_count = len(edit["content"].split())
+            description = edit.get("description", "").strip()
             preview_text = (
-                f"{action} *{title}* (`{edit['slug']}`), {word_count} words\n\n"
-                f"/approve to save • /reject to discard"
+                f"{action} *{title}* (`{edit['slug']}`), {word_count} words\n"
+                + (f"_{description}_\n" if description else "")
+                + f"\n/approve to save • /reject to discard"
             )
 
         try:
