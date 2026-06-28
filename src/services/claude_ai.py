@@ -89,8 +89,6 @@ def _build_system_prompt(
 
     return f"""You are Aria, {name}'s personal assistant and wiki specialist on Telegram.
 
-Your primary job is maintaining {name}'s personal knowledge wiki — writing and editing concise, factual entries. Think Karpathy-style: dense, no fluff, a few lines per page at most. Never write an essay.
-
 **Personality:** sharp, warm, slightly flirty, concise. Push back when something seems off. Use his name sometimes. Emojis sparingly.
 
 **Replies:** one short message, a sentence or two. Never more than a short paragraph unless asked. Telegram markdown only (`*bold*`, `_italic_`, `` `code` ``).
@@ -103,14 +101,7 @@ Your primary job is maintaining {name}'s personal knowledge wiki — writing and
 To load a specific page: `<wiki_search>keyword</wiki_search>`
 When reading: summarise naturally, don't dump raw text.
 
-**When writing or editing**, include the draft inline after a one-line acknowledgement:
-
-Create: `<wiki_create slug="slug" title="Title">content</wiki_create>`
-Update (full page): `<wiki_update slug="slug">content</wiki_update>`
-Delete: `<wiki_delete slug="slug" />`
-
-Wiki content rules: factual, a short paragraph at most, only markdown that earns it. Always include the tag — never acknowledge without the draft.
-Do NOT mention /approve or /reject.
+When {name} asks to create or update a wiki page, reply with ONE short sentence describing what you're capturing — e.g. "Adding a RAG page covering retrieval pipeline and chunking strategies." The actual draft is handled separately. Do NOT write the content yourself. Do NOT mention /approve or /reject.
 
 ---
 
@@ -282,10 +273,19 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         if forget_terms:
             process_forgets(user_id, forget_terms)
 
-        # ── Wiki edits — parse tags from Aria's response ─────
-        clean_text, wiki_edits = parse_wiki_edits(clean_text)
-        if wiki_edits:
-            log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
+        # ── Wiki edits — dedicated writer call ───────────────
+        wiki_intent = _detect_wiki_intent(user_message, has_image=image_data is not None)
+        wiki_edits = []
+        if wiki_intent:
+            log.info(f"Wiki intent detected ({wiki_intent}) — calling wiki writer")
+            wiki_edits = _wiki_writer_call(user_message, wiki_intent, wiki_context, aria_reply=clean_text, image_data=image_data)
+            if wiki_edits:
+                log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
+
+        # Also catch any tags Aria may have included anyway
+        clean_text, tag_edits = parse_wiki_edits(clean_text)
+        if tag_edits and not wiki_edits:
+            wiki_edits = tag_edits
 
         # Stash wiki edits for the handler
         _last_wiki_edits.clear()
@@ -508,87 +508,68 @@ def _detect_wiki_intent(message: str, has_image: bool = False) -> str | None:
     return None
 
 
-def _generate_wiki_content(user_message: str, intent: str, wiki_context: str | None, aria_response: str | None = None) -> list[dict]:
-    """Make a dedicated API call to generate wiki content. Returns list of edits."""
-    import json as _json
-    import uuid
-
+def _wiki_writer_call(
+    user_message: str,
+    intent: str,
+    wiki_context: str | None,
+    aria_reply: str | None = None,
+    image_data: dict | None = None,
+) -> list[dict]:
+    """Dedicated wiki writer agent. Returns parsed wiki edits."""
     try:
-        context_block = ""
+        context_parts = []
         if wiki_context:
-            context_block = f"\n\nExisting wiki content that may be relevant:\n{wiki_context}"
-        if aria_response:
-            context_block += f"\n\nYour assistant already drafted this response to the user (use this as the basis for the wiki content if it contains the relevant material):\n{aria_response}"
+            context_parts.append(f"Existing wiki content:\n{wiki_context}")
+        if aria_reply:
+            context_parts.append(f"Aria's summary of what to capture: {aria_reply}")
+
+        context_block = ("\n\n" + "\n\n".join(context_parts)) if context_parts else ""
 
         if intent == "delete":
             system = (
-                "You are a wiki manager. The user wants to delete a page. "
-                "Based on the user's message and the available wiki pages, identify which page to delete. "
-                "Respond with ONLY a JSON object, no other text:\n"
-                '{"action": "delete", "slug": "the-page-slug", "title": "The Page Title"}'
+                "You are a wiki manager. Identify which page to delete based on the user's request and available pages.\n"
+                "Output ONLY this tag, nothing else:\n"
+                '<wiki_delete slug="the-page-slug" />'
             )
         elif intent == "create":
             system = (
-                "You are a wiki content writer. The user wants to create a new wiki page. "
-                "Write the full page content based on their request. "
-                "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
-                '{"action": "create", "slug": "lowercase-hyphenated-slug", "title": "Page Title", "content": "Full page content here..."}'
-                "\n\nWrite substantial, well-structured content in markdown. The content field should be the complete page."
+                "You are a wiki writer. Write a concise, factual wiki page in Karpathy style — dense, no fluff, a short paragraph at most.\n"
+                "Output ONLY this tag, nothing else:\n"
+                '<wiki_create slug="lowercase-slug" title="Page Title">content</wiki_create>'
             )
-        else:  # update
+        else:
             system = (
-                "You are a wiki editor. The user wants to update an existing wiki page. "
-                "Based on the existing page content and the user's request, produce the complete updated page. "
-                "Respond with ONLY a JSON object, no other text, no markdown fences:\n"
-                '{"action": "update", "slug": "existing-page-slug", "title": "Page Title", "content": "Complete updated page content..."}'
-                "\n\nThe content field must contain the ENTIRE page (not just changes). Merge the existing content with the requested changes."
+                "You are a wiki editor. Produce the complete updated page by merging existing content with the new information. "
+                "Karpathy style: dense, factual, a short paragraph at most.\n"
+                "Output ONLY this tag, nothing else:\n"
+                '<wiki_update slug="existing-slug">full updated content</wiki_update>'
             )
 
-        user_content = f"User's request: {user_message}{context_block}"
+        user_parts: list = []
+        if image_data:
+            user_parts.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": image_data["media_type"], "data": image_data["base64"]},
+            })
+        user_parts.append({"type": "text", "text": f"Request: {user_message}{context_block}"})
 
         response = get_client().messages.create(
             model=cfg.claude_model,
-            max_tokens=4000,
+            max_tokens=1024,
             system=system,
-            messages=[{"role": "user", "content": user_content}],
+            messages=[{"role": "user", "content": user_parts}],
         )
 
-        result_text = response.content[0].text if response.content else ""
+        result_text = response.content[0].text.strip() if response.content else ""
+        log.info(f"Wiki writer output: {result_text[:120]}")
 
-        # Strip markdown fences if present
-        result_text = result_text.strip()
-        if result_text.startswith("```"):
-            result_text = result_text.split("\n", 1)[-1]
-        if result_text.endswith("```"):
-            result_text = result_text.rsplit("```", 1)[0]
-        result_text = result_text.strip()
+        _, edits = parse_wiki_edits(result_text)
+        if not edits:
+            log.warning(f"Wiki writer returned no parseable tags; raw: {result_text[:200]}")
+        return edits
 
-        data = _json.loads(result_text)
-
-        edit_id = str(uuid.uuid4())[:8]
-        edit = {
-            "id": edit_id,
-            "type": data.get("action", intent),
-            "slug": data.get("slug", ""),
-            "title": data.get("title"),
-            "content": data.get("content", ""),
-        }
-
-        if not edit["content"] and intent != "delete":
-            log.warning(f"Wiki content call returned empty content for {edit['slug']!r}; raw: {result_text[:200]}")
-
-        # Store in pending edits
-        _pending_wiki_edits[edit_id] = edit
-        log.info(f"Wiki content generated: {edit['type']} {edit['slug']}")
-        return [edit]
-
-    except _json.JSONDecodeError as e:
-        log.error(f"Wiki content call returned invalid JSON: {e}; raw: {result_text[:200] if 'result_text' in dir() else '(not set)'}")
-        # Try to extract from XML tags as fallback
-        _, tag_edits = parse_wiki_edits(result_text)
-        return tag_edits
     except Exception as e:
-        log.error(f"Wiki content generation failed: {e}")
+        log.error(f"Wiki writer call failed: {e}")
         return []
 
 _IMAGE_RE = re.compile(
