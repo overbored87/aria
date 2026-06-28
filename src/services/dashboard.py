@@ -187,7 +187,7 @@ def get_wiki_titles() -> list[dict]:
             db.table("wiki_pages")
             .select("title, slug, updated_at")
             .order("updated_at", desc=True)
-            .limit(100)
+            .limit(30)
             .execute()
         )
         return result.data or []

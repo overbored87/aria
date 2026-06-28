@@ -107,7 +107,7 @@ When resolved: `<forget>keyword</forget>` — always forget before adding an upd
 _TOOLS = [
     {
         "name": "search_wiki",
-        "description": "Search wiki pages by keyword. Use to find relevant pages before reading or editing.",
+        "description": "Search wiki pages by keyword. Returns titles, slugs, and short snippets. Use read_wiki_page to get full content.",
         "input_schema": {
             "type": "object",
             "properties": {"query": {"type": "string"}},
@@ -214,7 +214,16 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
             if not dashboard_svc.is_configured():
                 return "Wiki not configured."
             pages = dashboard_svc.search_wiki(tool_input["query"])
-            return dashboard_svc.format_wiki_results_for_context(pages) or "No results found."
+            if not pages:
+                return "No results found."
+            # Return title + slug + first 150 chars only — use read_wiki_page for full content
+            lines = []
+            for p in pages:
+                snippet = (p.get("content") or "")[:150].replace("\n", " ")
+                if len(p.get("content", "")) > 150:
+                    snippet += "..."
+                lines.append(f"- **{p['title']}** (`{p['slug']}`): {snippet}")
+            return "\n".join(lines)
 
         elif name == "read_wiki_page":
             if not dashboard_svc.is_configured():

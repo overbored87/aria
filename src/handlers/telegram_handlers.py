@@ -210,12 +210,26 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Download to bytes
     photo_bytes = await photo_file.download_as_bytearray()
-    b64_data = base64.b64encode(bytes(photo_bytes)).decode("utf-8")
+
+    # Resize to max 1024px to reduce Claude vision token cost
+    from PIL import Image
+    import io
+    img = Image.open(io.BytesIO(bytes(photo_bytes)))
+    max_side = 1024
+    if max(img.size) > max_side:
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        photo_bytes = buf.getvalue()
+        log.info(f"Photo resized to {img.size}, {len(photo_bytes)} bytes")
+    else:
+        photo_bytes = bytes(photo_bytes)
+        log.info(f"Photo unchanged: {img.size}, {len(photo_bytes)} bytes")
+
+    b64_data = base64.b64encode(photo_bytes).decode("utf-8")
 
     # Determine media type (Telegram photos are always JPEG)
     media_type = "image/jpeg"
-
-    log.info(f"Photo downloaded: {len(photo_bytes)} bytes, sending to Claude")
 
     # Show typing
     await update.effective_chat.send_action("typing")
