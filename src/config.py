@@ -33,6 +33,10 @@ class Config:
     quiet_end: int = 7      # 7 AM
     max_proactive_per_day: int = 5
 
+    # OpenAI (wiki writer)
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_wiki_model: str = "gpt-4o"
+
     # Serper.dev (optional — web search disabled if not set)
     serper_api_key: str = os.getenv("SERPER_API_KEY", "")
 

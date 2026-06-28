@@ -77,9 +77,8 @@ You have tools available. Use them proactively:
 - **Web search:** call `web_search` when you need current info or facts you're unsure of
 - After proposing a wiki edit, reply with one sentence describing what you drafted. Do NOT mention /approve or /reject.
 
-## Wiki Style (for all wiki content you write)
-Karpathy style: dense, factual, no filler. Start directly with content — no intro sentence, no "this page covers...". Use `##` headers for 3+ distinct sections, bullets for lists, bold for key terms. For updates: preserve existing structure, only change what's new.
-Default length: under 400 words. Write longer only if the user explicitly asks for a detailed or comprehensive article.
+## Wiki
+A dedicated writer handles article content — you just decide what to write and pass a brief. For updates, read the page first then describe what needs to change. After proposing, reply with one sentence summarising what you drafted.
 
 ## Memory
 When {name} shares something worth keeping, append to your response:
@@ -127,36 +126,34 @@ _TOOLS = [
     {
         "name": "propose_wiki_create",
         "description": (
-            "Propose creating a new wiki page for user approval. "
-            "Default: concise, under 400 words, Karpathy style — dense, factual, no intro sentence, no filler. "
-            "## headers only for 3+ sections. Bullets for lists. Bold key terms. "
-            "Write longer only if the user explicitly asks for a detailed or comprehensive article."
+            "Propose creating a new wiki page. Pass a brief describing what the page should cover — "
+            "a dedicated writer will produce the actual content. Do NOT write the article yourself."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "slug": {"type": "string", "description": "lowercase-hyphenated-slug"},
                 "title": {"type": "string"},
-                "content": {"type": "string", "description": "Full page content in markdown"},
+                "brief": {"type": "string", "description": "What the page should cover — key topics, facts, context. 2-5 sentences."},
             },
-            "required": ["slug", "title", "content"],
+            "required": ["slug", "title", "brief"],
         },
     },
     {
         "name": "propose_wiki_update",
         "description": (
-            "Propose updating an existing wiki page for user approval. "
-            "Always read the page first. Merge existing + new info — preserve accurate content, "
-            "update only what changed. Output the FULL updated page. STRICT: max 400 words total."
+            "Propose updating an existing wiki page. Always read the page first. "
+            "Pass the existing content and a description of what to change — a dedicated writer will produce the updated article."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "slug": {"type": "string"},
                 "title": {"type": "string"},
-                "content": {"type": "string", "description": "Complete updated page content"},
+                "existing_content": {"type": "string", "description": "Current page content from read_wiki_page"},
+                "changes": {"type": "string", "description": "What to add, update, or remove. Be specific."},
             },
-            "required": ["slug", "content"],
+            "required": ["slug", "existing_content", "changes"],
         },
     },
     {
@@ -180,6 +177,36 @@ _TOOLS = [
 ]
 
 
+_WIKI_WRITER_SYSTEM = (
+    "You are a wiki writer. Write concise, factual wiki pages in Karpathy style. "
+    "Dense and direct — no intro sentence, no 'this page covers...', no filler. "
+    "Use ## headers only when there are 3+ distinct sections. Bullets for lists. Bold key terms. "
+    "Default length: under 400 words. Write longer only if the brief explicitly requests a detailed article. "
+    "Output markdown only — no commentary, no preamble."
+)
+
+
+def _call_wiki_writer(prompt: str) -> str:
+    """Call GPT-4o to write wiki content. Returns markdown string."""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=cfg.openai_api_key)
+        response = client.chat.completions.create(
+            model=cfg.openai_wiki_model,
+            max_tokens=1200,
+            messages=[
+                {"role": "system", "content": _WIKI_WRITER_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = response.choices[0].message.content or ""
+        log.info(f"Wiki writer produced {len(content.split())} words")
+        return content.strip()
+    except Exception as e:
+        log.error(f"Wiki writer call failed: {e}")
+        raise
+
+
 def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
     import uuid
     try:
@@ -198,7 +225,10 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
             return f"Page '{tool_input['slug']}' not found."
 
         elif name == "propose_wiki_create":
-            content = tool_input["content"]
+            if not cfg.openai_api_key:
+                return "Wiki writer not configured (missing OPENAI_API_KEY)."
+            prompt = f"Write a wiki page titled '{tool_input['title']}'.\n\nBrief: {tool_input['brief']}"
+            content = _call_wiki_writer(prompt)
             edit_id = str(uuid.uuid4())[:8]
             edit = {
                 "id": edit_id,
@@ -214,7 +244,14 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
             return f"Queued for approval: '{tool_input['title']}'"
 
         elif name == "propose_wiki_update":
-            content = tool_input["content"]
+            if not cfg.openai_api_key:
+                return "Wiki writer not configured (missing OPENAI_API_KEY)."
+            prompt = (
+                f"Update the following wiki page.\n\n"
+                f"Current content:\n{tool_input['existing_content']}\n\n"
+                f"Changes requested: {tool_input['changes']}"
+            )
+            content = _call_wiki_writer(prompt)
             edit_id = str(uuid.uuid4())[:8]
             edit = {
                 "id": edit_id,
