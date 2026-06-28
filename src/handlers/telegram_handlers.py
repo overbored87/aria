@@ -264,22 +264,13 @@ async def _send_wiki_preview(chat, edit: dict) -> None:
 
         if edit["type"] == "delete":
             preview_text = (
-                f"{action} wiki page: *{title}*\n"
-                f"Slug: `{edit['slug']}`\n\n"
-                f"This will permanently delete the page.\n\n"
+                f"{action} *{title}* (`{edit['slug']}`)\n\n"
                 f"/approve to confirm • /reject to cancel"
             )
         else:
-            # Truncate to ~300 chars for preview
-            content_preview = edit["content"][:300]
-            if len(edit["content"]) > 300:
-                content_preview += "..."
-
+            word_count = len(edit["content"].split())
             preview_text = (
-                f"{action} wiki page: *{title}*\n"
-                f"Slug: `{edit['slug']}`\n"
-                f"Content: {len(edit['content'])} chars\n\n"
-                f"Preview:\n{content_preview}\n\n"
+                f"{action} *{title}* (`{edit['slug']}`), {word_count} words\n\n"
                 f"/approve to save • /reject to discard"
             )
 
