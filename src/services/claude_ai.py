@@ -531,7 +531,8 @@ def _wiki_writer_call(
 
         STYLE = (
             "Karpathy style: dense, factual, no filler. "
-            "Under 80 words. Bullet points only if genuinely list-like. No headers unless the page has multiple distinct sections."
+            "Use markdown formatting — ## headers to separate distinct sections, bullet points for lists, bold for key terms. "
+            "Keep it concise: a few lines per section, no padding. Think a well-structured reference card, not an essay."
         )
         if intent == "delete":
             system = (
