@@ -370,14 +370,18 @@ async def _send_split_response(
     """Send response as a single message, followed by any images."""
     chat = update.effective_chat
 
-    if text.strip():
-        try:
-            await chat.send_message(text.strip(), parse_mode="Markdown")
-        except Exception:
+    text = text.strip()
+    if text:
+        # Telegram max message length is 4096 chars
+        chunks = [text[i:i+4096] for i in range(0, len(text), 4096)]
+        for chunk in chunks:
             try:
-                await chat.send_message(text.strip())
-            except Exception as e:
-                log.error(f"Failed to send message: {e}")
+                await chat.send_message(chunk, parse_mode="Markdown")
+            except Exception:
+                try:
+                    await chat.send_message(chunk)
+                except Exception as e:
+                    log.error(f"Failed to send message: {e}")
 
     # Send any images
     for img in (images or []):
