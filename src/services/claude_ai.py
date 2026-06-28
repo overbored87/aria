@@ -495,13 +495,13 @@ def _detect_wiki_intent(message: str, has_image: bool = False) -> str | None:
         return "delete" if ("wiki" in msg or has_image) else None
 
     # Create
-    if any(c in msg for c in ["create", "new", "start", "draft", "make"]):
+    if any(c in msg for c in ["create", "new", "start", "draft", "make", "write"]):
         return "create" if ("wiki" in msg or has_image) else None
 
     # Update
     if any(a in msg for a in ["update", "edit", "add", "append", "modify", "change",
                                 "revise", "rewrite", "include", "put", "insert",
-                                "note", "record", "save", "write", "log", "track"]):
+                                "note", "record", "save", "log", "track"]):
         return "update" if ("wiki" in msg or has_image) else None
 
     return None

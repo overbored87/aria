@@ -322,6 +322,14 @@ async def _cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             content=edit["content"],
             title=edit.get("title"),
         )
+        if result is None:
+            # Page doesn't exist yet — create it instead
+            result = dashboard_svc.create_wiki_page(
+                user_id=user_id,
+                title=edit.get("title") or edit["slug"],
+                slug=edit["slug"],
+                content=edit["content"],
+            )
         success = result is not None
 
     elif edit["type"] == "delete":
