@@ -181,7 +181,8 @@ _WIKI_WRITER_SYSTEM = (
     "You are a wiki writer. Write concise, factual wiki pages in Karpathy style. "
     "Dense and direct — no intro sentence, no 'this page covers...', no filler. "
     "Use ## headers only when there are 3+ distinct sections. Bullets for lists. Bold key terms. "
-    "Default length: under 400 words. Write longer only if the brief explicitly requests a detailed article. "
+    "Default length: under 400 words. Write longer only if the brief explicitly requests a detailed, "
+    "comprehensive, or verbatim article — in that case, do not truncate or summarize; include everything. "
     "Output markdown only — no commentary, no preamble."
 )
 
@@ -193,7 +194,7 @@ def _call_wiki_writer(prompt: str) -> str:
         client = OpenAI(api_key=cfg.openai_api_key)
         response = client.chat.completions.create(
             model=cfg.openai_wiki_model,
-            max_tokens=1200,
+            max_tokens=4096,
             messages=[
                 {"role": "system", "content": _WIKI_WRITER_SYSTEM},
                 {"role": "user", "content": prompt},
@@ -371,6 +372,14 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
                     {"role": "assistant", "content": response.content},
                     {"role": "user", "content": tool_results},
                 ]
+            elif response.stop_reason == "max_tokens":
+                log.warning("Claude hit max_tokens mid-response — response truncated")
+                if not final_text.strip():
+                    final_text = (
+                        "That response was too long and got cut off — try asking for it "
+                        "in smaller chunks (e.g. one section at a time)."
+                    )
+                break
             else:
                 break
 
