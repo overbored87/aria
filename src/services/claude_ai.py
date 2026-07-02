@@ -6,14 +6,12 @@ memory extraction, proactive message generation, and conversation summarization.
 
 from __future__ import annotations
 import re
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import anthropic
 
 from src.config import cfg
 from src.utils.logger import log
-from src.utils.time_helpers import format_user_time, time_of_day, now_user, utc_to_user
+from src.utils.time_helpers import format_user_time, utc_to_user
 from src.services.database import (
     get_recent_conversation,
     get_active_memories,
@@ -73,12 +71,9 @@ def _build_system_prompt(memories: list[dict], summaries: list[dict]) -> str:
 ## Tools
 You have tools available. Use them proactively:
 - **Wiki reads:** always call `read_wiki_page` before updating a page — never assume content
-- **Wiki writes:** use `propose_wiki_create` or `propose_wiki_update` — the user approves before saving
+- **Wiki writes:** use `propose_wiki_create` or `propose_wiki_update` — a dedicated writer produces the article from your brief, and the user approves before saving. For updates, read the page first then describe what needs to change.
 - **Web search:** call `web_search` when you need current info or facts you're unsure of
 - After proposing a wiki edit, reply with one sentence describing what you drafted. Do NOT mention /approve or /reject.
-
-## Wiki
-A dedicated writer handles article content — you just decide what to write and pass a brief. For updates, read the page first then describe what needs to change. After proposing, reply with one sentence summarising what you drafted.
 
 ## Memory
 When {name} shares something worth keeping, append to your response:
@@ -187,12 +182,21 @@ _WIKI_WRITER_SYSTEM = (
 )
 
 
+_openai_client = None
+
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=cfg.openai_api_key)
+    return _openai_client
+
+
 def _call_wiki_writer(prompt: str) -> str:
     """Call GPT-4o to write wiki content. Returns markdown string."""
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=cfg.openai_api_key)
-        response = client.chat.completions.create(
+        response = _get_openai_client().chat.completions.create(
             model=cfg.openai_wiki_model,
             max_tokens=4096,
             messages=[
@@ -248,7 +252,7 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
                 "content": content,
                 "description": "",
             }
-            _pending_wiki_edits[edit_id] = edit
+            _register_pending_edit(edit)
             wiki_edits.append(edit)
             log.info(f"Wiki create proposed: {tool_input['slug']} ({len(content.split())} words)")
             return f"Queued for approval: '{tool_input['title']}'"
@@ -271,7 +275,7 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
                 "content": content,
                 "description": "",
             }
-            _pending_wiki_edits[edit_id] = edit
+            _register_pending_edit(edit)
             wiki_edits.append(edit)
             log.info(f"Wiki update proposed: {tool_input['slug']} ({len(content.split())} words)")
             return f"Update queued for approval: '{tool_input['slug']}'"
@@ -286,7 +290,7 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
                 "content": "",
                 "description": "",
             }
-            _pending_wiki_edits[edit_id] = edit
+            _register_pending_edit(edit)
             wiki_edits.append(edit)
             log.info(f"Wiki delete proposed: {tool_input['slug']}")
             return f"Delete queued for approval: '{tool_input['slug']}'"
@@ -307,8 +311,12 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
 # ─── Response Generation ────────────────────────────────────
 
 
-def generate_response(user_id: int, user_message: str, image_data: dict | None = None) -> str:
-    """Generate Aria's response using an agentic tool loop."""
+def generate_response(
+    user_id: int, user_message: str, image_data: dict | None = None
+) -> tuple[str, list[dict]]:
+    """Generate Aria's response using an agentic tool loop.
+
+    Returns (reply_text, wiki_edits_pending_approval)."""
     try:
         memories = get_active_memories(user_id)
         summaries = get_recent_summaries(user_id, 3)
@@ -341,11 +349,17 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         wiki_edits: list[dict] = []
         final_text = ""
 
+        # cache_control on the system block caches tools+system, so loop
+        # iterations 2+ (and rapid follow-up turns) read the prefix from cache
+        system_blocks = [
+            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+        ]
+
         for iteration in range(6):
             response = get_client().messages.create(
                 model=cfg.claude_model,
                 max_tokens=cfg.max_tokens,
-                system=system,
+                system=system_blocks,
                 tools=_TOOLS,
                 messages=messages,
             )
@@ -408,31 +422,17 @@ def generate_response(user_id: int, user_message: str, image_data: dict | None =
         if wiki_edits:
             log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
 
-        _last_wiki_edits.clear()
-        _last_wiki_edits.extend(wiki_edits)
-
-        return clean_text
+        return clean_text, wiki_edits
 
     except anthropic.RateLimitError:
         log.warning("Claude rate limited")
-        return "Give me a sec, I'm a bit overwhelmed right now. Try again in a moment? 😅"
+        return "Give me a sec, I'm a bit overwhelmed right now. Try again in a moment? 😅", []
     except anthropic.APIStatusError as e:
         log.error(f"Claude API error: {e.status_code} — {e.message}")
-        return "Something glitched on my end. Try again?"
+        return "Something glitched on my end. Try again?", []
     except Exception as e:
         log.error(f"Unexpected error in generate_response: {e}", exc_info=True)
-        return "Something glitched on my end. Try again?"
-
-
-# Temp storage for wiki edits between generate_response and handler
-_last_wiki_edits: list[dict] = []
-
-
-def get_pending_wiki_edits_from_response() -> list[dict]:
-    """Pop wiki edits extracted from the last response."""
-    edits = list(_last_wiki_edits)
-    _last_wiki_edits.clear()
-    return edits
+        return "Something glitched on my end. Try again?", []
 
 
 # ─── Proactive Message Generation ───────────────────────────
@@ -606,145 +606,13 @@ _MEMORY_RE = re.compile(
 )
 
 
-def _detect_wiki_intent(message: str, has_image: bool = False) -> str | None:
-    """Detect if a message is asking to create/edit/delete a wiki page.
-    Requires 'wiki' in text messages; for images, action words alone are enough."""
-    msg = message.lower().strip()
-
-    # Delete
-    if any(d in msg for d in ["delete", "remove", "destroy", "get rid of"]):
-        return "delete" if ("wiki" in msg or has_image) else None
-
-    # Create
-    if any(c in msg for c in ["create", "new", "start", "draft", "make", "write"]):
-        return "create" if ("wiki" in msg or has_image) else None
-
-    # Update
-    if any(a in msg for a in ["update", "edit", "add", "append", "modify", "change",
-                                "revise", "rewrite", "include", "put", "insert",
-                                "note", "record", "save", "log", "track"]):
-        return "update" if ("wiki" in msg or has_image) else None
-
-    return None
-
-
-def _wiki_writer_call(
-    user_message: str,
-    intent: str,
-    wiki_context: str | None,
-    aria_reply: str | None = None,
-    image_data: dict | None = None,
-) -> list[dict]:
-    """Dedicated wiki writer agent. Returns parsed wiki edits."""
-    try:
-        context_parts = []
-        if wiki_context:
-            context_parts.append(f"Existing wiki content:\n{wiki_context}")
-        if aria_reply:
-            context_parts.append(f"Aria's summary of what to capture: {aria_reply}")
-
-        context_block = ("\n\n" + "\n\n".join(context_parts)) if context_parts else ""
-
-        CREATE_STYLE = (
-            "Karpathy style. Max 400 words. "
-            "Use ## headers only if there are 3+ distinct sections. "
-            "Bullet points for lists, bold for key terms. "
-            "Every sentence must earn its place — no intro, no summary, no 'this page covers...'. "
-            "Start directly with the content."
-        )
-        EDIT_STYLE = (
-            "You are merging new information into an existing wiki page. "
-            "Preserve all existing content that is still accurate. "
-            "Add or update only what has changed — do not rewrite for style. "
-            "Keep the same structure unless restructuring genuinely improves it. "
-            "Max 400 words total. No filler, no commentary about what changed."
-        )
-        if intent == "delete":
-            system = (
-                "Identify which wiki page to delete based on the user's request.\n"
-                "Output ONLY this tag, nothing else:\n"
-                '<wiki_delete slug="the-page-slug" />'
-            )
-        elif intent == "create":
-            system = (
-                f"Write a concise wiki page. {CREATE_STYLE}\n"
-                "Output ONLY this tag, nothing else:\n"
-                '<wiki_create slug="lowercase-slug" title="Page Title">content</wiki_create>'
-            )
-        else:
-            system = (
-                f"{EDIT_STYLE}\n"
-                "Output the full updated page. Output ONLY this tag, nothing else:\n"
-                '<wiki_update slug="existing-slug">full updated content</wiki_update>'
-            )
-
-        user_parts: list = []
-        if image_data:
-            user_parts.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": image_data["media_type"], "data": image_data["base64"]},
-            })
-        user_parts.append({"type": "text", "text": f"Request: {user_message}{context_block}"})
-
-        response = get_client().messages.create(
-            model=cfg.claude_model,
-            max_tokens=2048,
-            system=system,
-            messages=[{"role": "user", "content": user_parts}],
-        )
-
-        result_text = response.content[0].text.strip() if response.content else ""
-        log.info(f"Wiki writer output: {result_text[:120]}")
-
-        _, edits = parse_wiki_edits(result_text)
-        if not edits:
-            log.warning(f"Wiki writer returned no parseable tags; raw: {result_text[:200]}")
-        # Attach Aria's conversational summary as the description
-        for edit in edits:
-            edit["description"] = aria_reply or ""
-        return edits
-
-    except Exception as e:
-        log.error(f"Wiki writer call failed: {e}")
-        return []
-
 _IMAGE_RE = re.compile(
     r'<image\s+url="([^"]+)">(.*?)</image>',
     re.DOTALL,
 )
 
-_SEARCH_RE = re.compile(
-    r'<search>(.*?)</search>',
-    re.DOTALL,
-)
-
-_IMAGE_SEARCH_RE = re.compile(
-    r'<image_search>(.*?)</image_search>',
-    re.DOTALL,
-)
-
-_WIKI_SEARCH_RE = re.compile(
-    r'<wiki_search>(.*?)</wiki_search>',
-    re.DOTALL,
-)
-
-_REMINDER_RE = re.compile(
-    r'<reminder\s+time="(\d{1,2}:\d{2})"(?:\s+date="(\d{4}-\d{2}-\d{2})")?>(.*?)</reminder>',
-    re.DOTALL,
-)
-
 _FORGET_RE = re.compile(
     r'<forget>(.*?)</forget>',
-    re.DOTALL,
-)
-
-_DONE_RE = re.compile(
-    r'<done>(.*?)</done>',
-    re.DOTALL,
-)
-
-_CANCEL_REMINDER_RE = re.compile(
-    r'<cancel_reminder>(.*?)</cancel_reminder>',
     re.DOTALL,
 )
 
@@ -788,61 +656,6 @@ def parse_images(text: str) -> tuple[str, list[dict]]:
     return clean, images
 
 
-def parse_reminders(text: str) -> tuple[str, list[dict]]:
-    """Extract <reminder> tags and return (clean_text, list_of_reminders).
-
-    Each reminder: {"time": "HH:MM", "date": "YYYY-MM-DD" or None, "message": str, "dt": datetime}
-    """
-    tz = ZoneInfo(cfg.user_timezone)
-    now = now_user()
-    reminders = []
-
-    for m in _REMINDER_RE.finditer(text):
-        time_str = m.group(1).strip()
-        date_str = m.group(2).strip() if m.group(2) else None
-        message = m.group(3).strip()
-
-        try:
-            hour, minute = map(int, time_str.split(":"))
-
-            if date_str:
-                year, month, day = map(int, date_str.split("-"))
-                dt = datetime(year, month, day, hour, minute, tzinfo=tz)
-
-                # Guard: if Claude hallucinated a past date, fix it
-                if dt < now:
-                    # Keep the time, but use today (or tomorrow if time passed)
-                    dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                    if dt <= now:
-                        dt += timedelta(days=1)
-                    log.warning(f"Reminder date was in the past — corrected to {dt.isoformat()}")
-            else:
-                # No date given: today, or tomorrow if time already passed
-                dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if dt <= now:
-                    dt += timedelta(days=1)
-
-            reminders.append({
-                "time": time_str,
-                "date": dt.strftime("%Y-%m-%d"),
-                "message": message,
-                "dt": dt,
-            })
-            log.info(f"Reminder parsed: '{message[:50]}' at {dt.isoformat()}")
-
-        except Exception as e:
-            log.error(f"Failed to parse reminder: {e}")
-
-    clean = _REMINDER_RE.sub("", text).strip()
-    return clean, reminders
-
-
-def _attach_reminder_confirmations(text: str, reminders: list[dict]) -> str:
-    """If Aria didn't already confirm the reminder, we don't add anything —
-    the system prompt tells her to confirm naturally in her response."""
-    return text
-
-
 def parse_forgets(text: str) -> tuple[str, list[str]]:
     """Extract <forget> tags and return (clean_text, list_of_search_terms)."""
     terms = []
@@ -867,52 +680,19 @@ def process_forgets(user_id: int, forget_terms: list[str]) -> int:
     return total
 
 
-def parse_done_tags(text: str) -> tuple[str, list[str]]:
-    """Extract <done> tags — keywords to match reminders to mark as completed."""
-    terms = []
-    for m in _DONE_RE.finditer(text):
-        term = m.group(1).strip()
-        if term:
-            terms.append(term)
-    clean = _DONE_RE.sub("", text).strip()
-    return clean, terms
-
-
-def parse_cancel_tags(text: str) -> tuple[str, list[str]]:
-    """Extract <cancel_reminder> tags — keywords to match reminders to cancel."""
-    terms = []
-    for m in _CANCEL_REMINDER_RE.finditer(text):
-        term = m.group(1).strip()
-        if term:
-            terms.append(term)
-    clean = _CANCEL_REMINDER_RE.sub("", text).strip()
-    return clean, terms
-
-
-def process_done_reminders(user_id: int, terms: list[str]) -> int:
-    """Mark reminders as done by keyword match."""
-    total = 0
-    for term in terms:
-        count = complete_reminders_matching(user_id, term)
-        total += count
-        log.info(f"Completed {count} reminders matching '{term}'")
-    return total
-
-
-def process_cancel_reminders(user_id: int, terms: list[str]) -> int:
-    """Cancel reminders by keyword match."""
-    total = 0
-    for term in terms:
-        count = cancel_reminders_matching(user_id, term)
-        total += count
-        log.info(f"Cancelled {count} reminders matching '{term}'")
-    return total
-
-
 # ─── Wiki Edit Tags ──────────────────────────────────────────
 
 # Pending wiki edits awaiting user approval: {edit_id: {type, slug, title, content}}
 _pending_wiki_edits: dict[str, dict] = {}
+_MAX_PENDING_EDITS = 20
+
+
+def _register_pending_edit(edit: dict) -> None:
+    """Track an edit awaiting approval, pruning the oldest beyond the cap."""
+    _pending_wiki_edits[edit["id"]] = edit
+    while len(_pending_wiki_edits) > _MAX_PENDING_EDITS:
+        oldest = next(iter(_pending_wiki_edits))
+        _pending_wiki_edits.pop(oldest)
 
 
 def parse_wiki_edits(text: str) -> tuple[str, list[dict]]:
@@ -931,7 +711,7 @@ def parse_wiki_edits(text: str) -> tuple[str, list[dict]]:
             "content": m.group(3).strip(),
         }
         edits.append(edit)
-        _pending_wiki_edits[edit_id] = edit
+        _register_pending_edit(edit)
 
     for m in _WIKI_UPDATE_RE.finditer(text):
         edit_id = str(uuid.uuid4())[:8]
@@ -943,7 +723,7 @@ def parse_wiki_edits(text: str) -> tuple[str, list[dict]]:
             "content": m.group(2).strip(),
         }
         edits.append(edit)
-        _pending_wiki_edits[edit_id] = edit
+        _register_pending_edit(edit)
 
     for m in _WIKI_DELETE_RE.finditer(text):
         edit_id = str(uuid.uuid4())[:8]
@@ -955,17 +735,12 @@ def parse_wiki_edits(text: str) -> tuple[str, list[dict]]:
             "content": "",
         }
         edits.append(edit)
-        _pending_wiki_edits[edit_id] = edit
+        _register_pending_edit(edit)
 
     clean = _WIKI_CREATE_RE.sub("", text)
     clean = _WIKI_UPDATE_RE.sub("", clean)
     clean = _WIKI_DELETE_RE.sub("", clean).strip()
     return clean, edits
-
-
-def get_pending_wiki_edit(edit_id: str) -> dict | None:
-    """Retrieve a pending wiki edit by ID."""
-    return _pending_wiki_edits.get(edit_id)
 
 
 def remove_pending_wiki_edit(edit_id: str) -> None:

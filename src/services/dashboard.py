@@ -142,39 +142,6 @@ def format_for_context(grouped_data: dict[str, list[dict]]) -> str:
 
 # ── Wiki ─────────────────────────────────────────────────────
 
-# Stop words to filter out from auto-search keyword extraction
-_STOP_WORDS = {
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "need", "dare", "ought",
-    "i", "me", "my", "mine", "we", "our", "you", "your", "he", "him",
-    "his", "she", "her", "it", "its", "they", "them", "their",
-    "what", "which", "who", "whom", "this", "that", "these", "those",
-    "am", "at", "by", "for", "with", "about", "against", "between",
-    "through", "during", "before", "after", "above", "below", "to",
-    "from", "up", "down", "in", "out", "on", "off", "over", "under",
-    "again", "further", "then", "once", "here", "there", "when", "where",
-    "why", "how", "all", "both", "each", "few", "more", "most", "other",
-    "some", "such", "no", "nor", "not", "only", "own", "same", "so",
-    "than", "too", "very", "just", "don", "now", "and", "but", "or",
-    "if", "of", "as", "into", "also", "tell", "show", "give", "get",
-    "know", "think", "want", "like", "make", "go", "see", "look",
-    "find", "say", "said", "let", "help", "hey", "aria", "please",
-    "thanks", "thank", "ok", "okay", "yeah", "yes", "no", "hi", "hello",
-    "whats", "what's", "hows", "how's", "whos", "who's",
-}
-
-
-def extract_search_keywords(message: str) -> list[str]:
-    """Extract meaningful keywords from a user message for wiki auto-search."""
-    import re
-    # Keep only alphanumeric and spaces
-    clean = re.sub(r"[^a-zA-Z0-9\s]", " ", message.lower())
-    words = clean.split()
-    # Filter stop words and very short words
-    keywords = [w for w in words if w not in _STOP_WORDS and len(w) > 2]
-    return keywords
-
 
 def get_wiki_titles() -> list[dict]:
     """Fetch all wiki page titles and slugs for context listing."""
@@ -193,62 +160,6 @@ def get_wiki_titles() -> list[dict]:
         return result.data or []
     except Exception as e:
         log.error(f"Wiki titles fetch error: {e}")
-        return []
-
-
-def auto_search_wiki(message: str, max_results: int = 3) -> list[dict]:
-    """Automatically search wiki based on user message keywords.
-    Returns matching pages ranked by relevance (number of keyword hits)."""
-    db = _get_dashboard_db()
-    if not db:
-        return []
-
-    keywords = extract_search_keywords(message)
-    if not keywords:
-        return []
-
-    try:
-        # Score each page by how many keywords match
-        all_pages = {}  # slug -> {page_data, score}
-
-        for keyword in keywords:
-            # Search titles
-            title_results = (
-                db.table("wiki_pages")
-                .select("title, slug, content, updated_at")
-                .ilike("title", f"%{keyword}%")
-                .limit(10)
-                .execute()
-            )
-            for row in title_results.data or []:
-                slug = row["slug"]
-                if slug not in all_pages:
-                    all_pages[slug] = {"page": row, "score": 0}
-                all_pages[slug]["score"] += 2  # Title match worth more
-
-            # Search content
-            content_results = (
-                db.table("wiki_pages")
-                .select("title, slug, content, updated_at")
-                .ilike("content", f"%{keyword}%")
-                .limit(10)
-                .execute()
-            )
-            for row in content_results.data or []:
-                slug = row["slug"]
-                if slug not in all_pages:
-                    all_pages[slug] = {"page": row, "score": 0}
-                all_pages[slug]["score"] += 1  # Content match
-
-        if not all_pages:
-            return []
-
-        # Sort by score descending, return top results
-        ranked = sorted(all_pages.values(), key=lambda x: x["score"], reverse=True)
-        return [item["page"] for item in ranked[:max_results]]
-
-    except Exception as e:
-        log.error(f"Wiki auto-search error: {e}")
         return []
 
 
@@ -448,19 +359,4 @@ def format_wiki_titles_for_context(titles: list[dict]) -> str:
         return ""
     lines = [f"  - {t['title']}" for t in titles]
     return "\n".join(lines)
-
-
-def format_wiki_results_for_context(pages: list[dict]) -> str:
-    """Format full wiki pages for Claude's context."""
-    if not pages:
-        return "No wiki pages matched."
-
-    sections = []
-    for page in pages:
-        content = page.get("content", "")
-        if len(content) > 3000:
-            content = content[:3000] + "\n... (truncated)"
-        sections.append(f"### {page['title']} (slug: {page['slug']})\n{content}")
-
-    return "\n\n".join(sections)
 

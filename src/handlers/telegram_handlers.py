@@ -21,14 +21,13 @@ from src.services.database import ensure_user, save_message, get_active_memories
 from src.services.claude_ai import (
     generate_response,
     parse_images,
-    get_pending_wiki_edits_from_response,
     remove_pending_wiki_edit,
 )
 from src.services import dashboard as dashboard_svc
 from src.services.summarizer import maybe_summarize
 
-# Module-level pending wiki edit (only one at a time)
-_pending_wiki_edit: dict | None = None
+# Wiki edits awaiting /approve or /reject (a single response can propose several)
+_pending_approval: list[dict] = []
 
 
 def register_handlers(app: Application) -> None:
@@ -163,8 +162,8 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Show typing indicator
     await update.effective_chat.send_action("typing")
 
-    # Generate response
-    response_text = generate_response(user_id, text)
+    # Generate response in a worker thread so the event loop stays responsive
+    response_text, wiki_edits = await asyncio.to_thread(generate_response, user_id, text)
 
     # Save both messages AFTER generation (so history doesn't double-include the current message)
     save_message(user_id, "user", text, metadata={
@@ -177,10 +176,8 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text_without_images, images = parse_images(response_text)
     await _send_split_response(update, text_without_images, images)
 
-    # Send wiki edit previews with approval buttons
-    wiki_edits = get_pending_wiki_edits_from_response()
-    for edit in wiki_edits:
-        await _send_wiki_preview(update.effective_chat, edit)
+    # Send wiki edit previews with approval instructions
+    await _queue_wiki_edits(update.effective_chat, wiki_edits)
 
     # Background: check if we need to summarize
     await maybe_summarize(user_id)
@@ -234,9 +231,11 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Show typing
     await update.effective_chat.send_action("typing")
 
-    # Generate response with vision
+    # Generate response with vision in a worker thread
     image_data = {"base64": b64_data, "media_type": media_type}
-    response_text = generate_response(user_id, caption, image_data=image_data)
+    response_text, wiki_edits = await asyncio.to_thread(
+        generate_response, user_id, caption, image_data=image_data
+    )
 
     # Save both messages AFTER generation
     save_message(user_id, "user", f"[Sent a photo] {caption}".strip(), metadata={
@@ -251,9 +250,7 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _send_split_response(update, text_without_images, images)
 
     # Send wiki edit previews
-    wiki_edits = get_pending_wiki_edits_from_response()
-    for edit in wiki_edits:
-        await _send_wiki_preview(update.effective_chat, edit)
+    await _queue_wiki_edits(update.effective_chat, wiki_edits)
 
     await maybe_summarize(user_id)
 
@@ -261,11 +258,22 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ─── Wiki Edit Preview & Approval ────────────────────────────
 
 
+async def _queue_wiki_edits(chat, wiki_edits: list[dict]) -> None:
+    """Queue wiki edits for approval and send a preview for each."""
+    global _pending_approval
+    if not wiki_edits:
+        return
+    _pending_approval = list(wiki_edits)
+    for edit in wiki_edits:
+        await _send_wiki_preview(chat, edit)
+    if len(wiki_edits) > 1:
+        await chat.send_message(
+            f"{len(wiki_edits)} edits pending — /approve or /reject applies to all."
+        )
+
+
 async def _send_wiki_preview(chat, edit: dict) -> None:
     """Send a truncated wiki edit preview with /approve /reject instructions."""
-    global _pending_wiki_edit
-    _pending_wiki_edit = edit
-
     try:
         if edit["type"] == "create":
             action = "📝 Create"
@@ -299,38 +307,21 @@ async def _send_wiki_preview(chat, edit: dict) -> None:
         log.error(f"Failed to send wiki preview: {e}")
 
 
-async def _cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Approve a pending wiki edit."""
-    global _pending_wiki_edit
-
-    if not _is_authorized(update):
-        return
-
-    if not _pending_wiki_edit:
-        await update.message.reply_text("Nothing pending to approve.")
-        return
-
-    edit = _pending_wiki_edit
+def _apply_wiki_edit(edit: dict) -> bool:
+    """Apply a single approved wiki edit. Returns success."""
     user_id = cfg.allowed_user_id
-    success = False
 
     if edit["type"] == "create":
+        # create_wiki_page falls back to update internally if the slug exists
         result = dashboard_svc.create_wiki_page(
             user_id=user_id,
             title=edit.get("title") or edit["slug"],
             slug=edit["slug"],
             content=edit["content"],
         )
-        if result is None:
-            # Upsert failed — try plain update
-            result = dashboard_svc.update_wiki_page(
-                slug=edit["slug"],
-                content=edit["content"],
-                title=edit.get("title"),
-            )
-        success = result is not None
+        return result is not None
 
-    elif edit["type"] == "update":
+    if edit["type"] == "update":
         result = dashboard_svc.update_wiki_page(
             slug=edit["slug"],
             content=edit["content"],
@@ -344,41 +335,63 @@ async def _cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 slug=edit["slug"],
                 content=edit["content"],
             )
-        success = result is not None
+        return result is not None
 
-    elif edit["type"] == "delete":
-        result = dashboard_svc.delete_wiki_page(slug=edit["slug"])
-        success = result
+    if edit["type"] == "delete":
+        return dashboard_svc.delete_wiki_page(slug=edit["slug"])
 
-    if success:
-        action = {"create": "created", "update": "updated", "delete": "deleted"}[edit["type"]]
-        await update.message.reply_text(f"✅ Wiki page '{edit.get('title') or edit['slug']}' {action}!")
-        log.info(f"Wiki {edit['type']} approved: {edit['slug']}")
-    else:
-        await update.message.reply_text("❌ Failed to save. Check logs.")
-        log.error(f"Wiki {edit['type']} failed: {edit['slug']}")
-
-    remove_pending_wiki_edit(edit["id"])
-    _pending_wiki_edit = None
+    return False
 
 
-async def _cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reject a pending wiki edit."""
-    global _pending_wiki_edit
+async def _cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approve all pending wiki edits."""
+    global _pending_approval
 
     if not _is_authorized(update):
         return
 
-    if not _pending_wiki_edit:
+    if not _pending_approval:
+        await update.message.reply_text("Nothing pending to approve.")
+        return
+
+    edits, _pending_approval = _pending_approval, []
+    action_word = {"create": "created", "update": "updated", "delete": "deleted"}
+    lines = []
+
+    for edit in edits:
+        name = edit.get("title") or edit["slug"]
+        success = await asyncio.to_thread(_apply_wiki_edit, edit)
+        if success:
+            lines.append(f"✅ '{name}' {action_word[edit['type']]}")
+            log.info(f"Wiki {edit['type']} approved: {edit['slug']}")
+        else:
+            lines.append(f"❌ '{name}' failed — check logs")
+            log.error(f"Wiki {edit['type']} failed: {edit['slug']}")
+        remove_pending_wiki_edit(edit["id"])
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reject all pending wiki edits."""
+    global _pending_approval
+
+    if not _is_authorized(update):
+        return
+
+    if not _pending_approval:
         await update.message.reply_text("Nothing pending to reject.")
         return
 
-    edit = _pending_wiki_edit
-    remove_pending_wiki_edit(edit["id"])
-    _pending_wiki_edit = None
+    edits, _pending_approval = _pending_approval, []
+    for edit in edits:
+        remove_pending_wiki_edit(edit["id"])
+        log.info(f"Wiki {edit['type']} rejected: {edit['slug']}")
 
-    await update.message.reply_text("❌ Wiki edit discarded.")
-    log.info(f"Wiki {edit['type']} rejected: {edit['slug']}")
+    count = len(edits)
+    await update.message.reply_text(
+        "❌ Wiki edit discarded." if count == 1 else f"❌ {count} wiki edits discarded."
+    )
 
 
 # ─── Multi-Message Sender ───────────────────────────────────
