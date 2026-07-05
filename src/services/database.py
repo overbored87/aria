@@ -31,7 +31,7 @@ def ensure_user(telegram_user) -> dict:
         "first_name": telegram_user.first_name or None,
         "timezone": cfg.user_timezone,
     }
-    result = db.table("users").upsert(data, on_conflict="id").execute()
+    result = db.table("aria_users").upsert(data, on_conflict="id").execute()
     return result.data[0] if result.data else data
 
 
@@ -47,7 +47,7 @@ def save_message(user_id: int, role: str, content: str, metadata: dict | None = 
         "token_estimate": estimate_tokens(content),
         "metadata": metadata or {},
     }
-    result = db.table("conversations").insert(row).execute()
+    result = db.table("aria_conversations").insert(row).execute()
     return result.data[0]["id"] if result.data else ""
 
 
@@ -59,7 +59,7 @@ def get_recent_conversation(user_id: int, token_budget: int | None = None) -> li
     budget = token_budget or cfg.token_budget
     db = get_db()
     result = (
-        db.table("conversations")
+        db.table("aria_conversations")
         .select("role, content, token_estimate")
         .eq("user_id", user_id)
         .order("created_at", desc=True)
@@ -85,7 +85,7 @@ def get_message_count(user_id: int, since_days: int = 1) -> int:
     db = get_db()
     since = (datetime.utcnow() - timedelta(days=since_days)).isoformat()
     result = (
-        db.table("conversations")
+        db.table("aria_conversations")
         .select("id", count="exact")
         .eq("user_id", user_id)
         .gte("created_at", since)
@@ -112,7 +112,7 @@ def save_memory(
         "importance": max(1, min(10, importance)),
         "source_message_id": source_message_id,
     }
-    result = db.table("memories").insert(row).execute()
+    result = db.table("aria_memories").insert(row).execute()
     if result.data:
         log.info(f"Memory saved [{category}]: {content[:80]}")
         return result.data[0]["id"]
@@ -123,7 +123,7 @@ def get_active_memories(user_id: int, limit: int = 30) -> list[dict]:
     """Fetch active memories sorted by importance then recency."""
     db = get_db()
     result = (
-        db.table("memories")
+        db.table("aria_memories")
         .select("id, category, content, importance, created_at")
         .eq("user_id", user_id)
         .eq("is_active", True)
@@ -138,7 +138,7 @@ def get_active_memories(user_id: int, limit: int = 30) -> list[dict]:
 def get_memories_by_category(user_id: int, category: str, limit: int = 10) -> list[dict]:
     db = get_db()
     result = (
-        db.table("memories")
+        db.table("aria_memories")
         .select("id, content, importance, created_at")
         .eq("user_id", user_id)
         .eq("category", category)
@@ -151,7 +151,7 @@ def get_memories_by_category(user_id: int, category: str, limit: int = 10) -> li
 
 
 def deactivate_memory(memory_id: str) -> None:
-    get_db().table("memories").update({"is_active": False}).eq("id", memory_id).execute()
+    get_db().table("aria_memories").update({"is_active": False}).eq("id", memory_id).execute()
 
 
 def deactivate_memories_matching(user_id: int, search_text: str) -> int:
@@ -159,7 +159,7 @@ def deactivate_memories_matching(user_id: int, search_text: str) -> int:
     Returns number of memories deactivated."""
     db = get_db()
     result = (
-        db.table("memories")
+        db.table("aria_memories")
         .select("id, content")
         .eq("user_id", user_id)
         .eq("is_active", True)
@@ -168,7 +168,7 @@ def deactivate_memories_matching(user_id: int, search_text: str) -> int:
     )
     count = 0
     for row in result.data or []:
-        db.table("memories").update({"is_active": False}).eq("id", row["id"]).execute()
+        db.table("aria_memories").update({"is_active": False}).eq("id", row["id"]).execute()
         log.info(f"Deactivated memory: {row['content'][:80]}")
         count += 1
     return count
@@ -177,7 +177,7 @@ def deactivate_memories_matching(user_id: int, search_text: str) -> int:
 # ── Conversation Summaries ───────────────────────────────────
 
 def save_summary(user_id: int, summary: str, period_start: str, period_end: str, message_count: int) -> None:
-    get_db().table("conversation_summaries").insert({
+    get_db().table("aria_conversation_summaries").insert({
         "user_id": user_id,
         "summary": summary,
         "period_start": period_start,
@@ -189,7 +189,7 @@ def save_summary(user_id: int, summary: str, period_start: str, period_end: str,
 def get_recent_summaries(user_id: int, limit: int = 5) -> list[dict]:
     db = get_db()
     result = (
-        db.table("conversation_summaries")
+        db.table("aria_conversation_summaries")
         .select("summary, period_start, period_end, message_count")
         .eq("user_id", user_id)
         .order("period_end", desc=True)
