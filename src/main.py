@@ -38,6 +38,9 @@ def main() -> None:
     register_handlers(app)
     scheduler = init_scheduler(app)
 
+    from src.sidecar.run import start_sidecar_in_thread
+    start_sidecar_in_thread()
+
     def shutdown_handler(signum, frame):
         log.info("Shutdown signal received...")
         scheduler.shutdown(wait=False)

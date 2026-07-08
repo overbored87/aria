@@ -40,6 +40,11 @@ class Config:
     # Serper.dev (optional — web search disabled if not set)
     serper_api_key: str = os.getenv("SERPER_API_KEY", "")
 
+    # Sidecar (Siren federation)
+    siren_api_key: str = os.getenv("SIREN_API_KEY", "")
+    siren_base_url: str = os.getenv("SIREN_BASE_URL", "")  # for /events oversight
+    sidecar_port: int = int(os.getenv("PORT", "8080"))     # host sets PORT
+
     # Dashboard Supabase (optional — separate DB for personal dashboard)
     dashboard_supabase_url: str = os.getenv("DASHBOARD_SUPABASE_URL", "")
     dashboard_supabase_key: str = os.getenv("DASHBOARD_SUPABASE_KEY", "")
