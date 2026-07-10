@@ -8,7 +8,6 @@ from telegram.ext import Application
 from src.config import cfg, ALLOWED_USER_IDS
 from src.utils.logger import log
 from src.handlers.telegram_handlers import register_handlers
-from src.services.scheduler import init_scheduler
 
 
 def main() -> None:
@@ -36,14 +35,12 @@ def main() -> None:
     )
 
     register_handlers(app)
-    scheduler = init_scheduler(app)
 
     from src.sidecar.run import start_sidecar_in_thread
     start_sidecar_in_thread()
 
     def shutdown_handler(signum, frame):
         log.info("Shutdown signal received...")
-        scheduler.shutdown(wait=False)
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown_handler)

@@ -29,9 +29,6 @@ class Config:
     # User defaults
     user_timezone: str = os.getenv("USER_TIMEZONE", "Asia/Singapore")
     user_name: str = "Kieran"
-    quiet_start: int = 23   # 11 PM
-    quiet_end: int = 7      # 7 AM
-    max_proactive_per_day: int = 5
 
     # OpenAI (wiki writer)
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
