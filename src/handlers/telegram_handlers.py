@@ -9,6 +9,7 @@ from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -39,6 +40,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("reject", _cmd_reject))
     app.add_handler(CommandHandler("wiki_approve", _cmd_wiki_approve))
     app.add_handler(CommandHandler("wiki_reject", _cmd_wiki_reject))
+    app.add_handler(CallbackQueryHandler(_cb_wiki, pattern=r"^wiki_(ok|no):"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message)
     )
@@ -440,20 +442,22 @@ async def _cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def _cmd_wiki_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Approve a sidecar research draft (job-based — separate from /approve,
-    which handles edits proposed live in an active chat)."""
+    which handles edits proposed live in an active chat).
+
+    Prefer the inline Save button on Aria's notification; this typed command is
+    a fallback. With no arg it acts on the latest pending draft, because tapping
+    the command in Telegram drops the job id after the space."""
     if not _is_authorized(update):
         return
     from src.sidecar import jobs as jobstore
 
-    if not context.args:
-        await update.message.reply_text("Usage: /wiki_approve <job_id>")
-        return
-    job = jobstore.get_job(context.args[0])
+    job = jobstore.get_job(context.args[0]) if context.args else jobstore.latest_actionable_job()
     if not job or not job.get("edit"):
-        await update.message.reply_text("No such research draft (it may have expired).")
+        await update.message.reply_text("No research draft waiting (it may have expired).")
         return
     edit = job["edit"]
     ok = await asyncio.to_thread(_apply_wiki_edit, edit)
+    jobstore.drop_job(job["job_id"])
     await update.message.reply_text(
         f"{'✅ Saved' if ok else '❌ Failed'}: {edit.get('title') or edit['slug']}"
     )
@@ -463,7 +467,45 @@ async def _cmd_wiki_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Discard a sidecar research draft without saving it."""
     if not _is_authorized(update):
         return
+    from src.sidecar import jobs as jobstore
+
+    job = jobstore.get_job(context.args[0]) if context.args else jobstore.latest_actionable_job()
+    if job:
+        jobstore.drop_job(job["job_id"])
     await update.message.reply_text("Discarded. Nothing was saved.")
+
+
+async def _cb_wiki(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the Save/Discard buttons on a research-draft notification.
+    callback_data is 'wiki_ok:<job_id>' or 'wiki_no:<job_id>'."""
+    query = update.callback_query
+    if not _is_authorized(update):
+        await query.answer("Not authorized", show_alert=True)
+        return
+    from src.sidecar import jobs as jobstore
+
+    await query.answer()
+    action, _, job_id = query.data.partition(":")
+
+    if action == "wiki_no":
+        jobstore.drop_job(job_id)
+        await query.edit_message_text("❌ Discarded. Nothing was saved.")
+        log.info(f"Research draft rejected via button: {job_id}")
+        return
+
+    job = jobstore.get_job(job_id)
+    if not job or not job.get("edit"):
+        await query.edit_message_text(
+            "This draft expired (Aria restarted). Ask again and I'll re-run it."
+        )
+        return
+
+    edit = job["edit"]
+    ok = await asyncio.to_thread(_apply_wiki_edit, edit)
+    jobstore.drop_job(job_id)
+    name = edit.get("title") or edit["slug"]
+    await query.edit_message_text(f"{'✅ Saved' if ok else '❌ Failed'}: {name}")
+    log.info(f"Research draft {'saved' if ok else 'FAILED'} via button: {job_id}")
 
 
 # ─── Multi-Message Sender ───────────────────────────────────

@@ -43,3 +43,20 @@ def finish_job(jid: str, *, result=None, edit=None, error: str | None = None) ->
             _jobs[jid]["result"] = result
             _jobs[jid]["edit"] = edit
             _jobs[jid]["error"] = error
+
+
+def drop_job(jid: str) -> None:
+    """Forget a job once it's been approved or discarded."""
+    with _lock:
+        _jobs.pop(jid, None)
+
+
+def latest_actionable_job() -> dict | None:
+    """Newest finished job that still has a draft waiting. Backs the no-arg
+    /wiki_approve fallback — tapping the command in Telegram drops its argument,
+    so with a single pending draft we can still act on the obvious one."""
+    with _lock:
+        pending = [j for j in _jobs.values() if j["status"] == "done" and j.get("edit")]
+        if not pending:
+            return None
+        return dict(max(pending, key=lambda j: j["created_at"]))

@@ -49,7 +49,7 @@ def main() -> None:
     log.info("Bot is live! Polling for messages...")
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message"],
+        allowed_updates=["message", "callback_query"],
     )
 
 

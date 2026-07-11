@@ -18,12 +18,15 @@ from src.sidecar.research import run_research_and_draft
 app = FastAPI(title="Aria sidecar")
 
 
-def _tg_send(text: str) -> None:
+def _tg_send(text: str, reply_markup: dict | None = None) -> None:
     """Notify the user in Aria's own voice, via her bot token — never Siren's."""
     try:
+        payload = {"chat_id": cfg.allowed_user_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         httpx.post(
             f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage",
-            json={"chat_id": cfg.allowed_user_id, "text": text},
+            json=payload,
             timeout=20.0,
         )
     except Exception:
@@ -64,10 +67,16 @@ def _run_research_job(job_id: str, args: dict) -> None:
                 f"\U0001F50E I researched \"{topic}\" and drafted a new {words}-word "
                 f"page, \"{edit['title']}\"."
             )
-        _tg_send(
-            f"{lead}\n\n/wiki_approve {job_id}  to save\n"
-            f"/wiki_reject {job_id}  to discard"
-        )
+        # Inline buttons carry the job id in callback_data, so a tap acts on this
+        # exact draft. (Tapping a "/wiki_approve <id>" text command would drop the
+        # id — Telegram only copies the command up to the first space.)
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "✅ Save", "callback_data": f"wiki_ok:{job_id}"},
+                {"text": "❌ Discard", "callback_data": f"wiki_no:{job_id}"},
+            ]]
+        }
+        _tg_send(lead, reply_markup=keyboard)
         _log_to_siren(
             "research_drafted",
             f"{verb.capitalize()} wiki page '{edit['title']}' from research on {topic}",

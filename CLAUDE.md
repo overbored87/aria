@@ -93,12 +93,19 @@ main thread). Endpoints: `GET /health` (Railway healthcheck), `POST /invoke`
 The latter (`src/sidecar/research.py`) returns a `job_id` immediately, then a
 daemon thread runs Serper search + the GPT-4o wiki writer, stores the draft in
 the in-memory `jobs` store (`src/sidecar/jobs.py`, ephemeral — lost on restart),
-and DMs the user via Aria's own bot token with `/wiki_approve <job_id>` /
-`/wiki_reject <job_id>`. It drafts a new page, or **revises an existing one** if
-a page already exists at the target slug (explicit `slug` arg, else the slug
-derived from the title/topic) — in which case the writer is fed the current page
-content and briefed to revise rather than overwrite (`edit["type"]` is
-`create` vs `update`). `_cmd_wiki_approve` reuses `_apply_wiki_edit` — the same
+and DMs the user via Aria's own bot token with inline **Save / Discard buttons**
+(`callback_data` `wiki_ok:<job_id>` / `wiki_no:<job_id>`, handled by `_cb_wiki`).
+The buttons carry the job id because a tapped `/wiki_approve <job_id>` text
+command drops its argument — Telegram only copies up to the first space. The
+typed `/wiki_approve` / `/wiki_reject` still work as a fallback and, with no arg,
+act on the latest pending draft (`jobstore.latest_actionable_job`). Button taps
+arrive as `callback_query` updates, so `run_polling`'s `allowed_updates` **must**
+include `"callback_query"` (see `main.py`) or the buttons silently do nothing.
+
+It drafts a new page, or **revises an existing one** if a page already exists at
+the target slug (explicit `slug` arg, else the slug derived from the title/topic)
+— in which case the writer is fed the current page content and briefed to revise
+rather than overwrite (`edit["type"]` is `create` vs `update`). `_cmd_wiki_approve` reuses `_apply_wiki_edit` — the same
 path as the live-chat `/approve` flow — so drafts never auto-save and Siren never
 touches `wiki_pages` directly. Completion is also POSTed to Siren's `/events` for
 oversight. See `PLAN-aria-sidecar.md`.
