@@ -46,13 +46,15 @@ def run_research_and_draft(topic: str, slug: str | None = None, title: str | Non
         slug = existing["slug"]
         title = title or existing["title"]
         brief = (
-            f"Revise the existing wiki page '{title}'.\n\n"
-            "Below is the current page followed by fresh research. Produce an "
-            "updated version of the whole page: keep what's still accurate, "
-            "correct what's outdated, and fold in genuinely new information. "
-            "Preserve the page's existing structure and voice where possible — "
-            "don't drop sections just because the research didn't mention them. "
-            "Note anything time-sensitive with its date.\n\n"
+            f"Revise the existing wiki page '{title}'. This is a REVISION, not a "
+            "summary — treat it as a comprehensive, verbatim edit.\n\n"
+            "Below is the current page followed by fresh research. Return the FULL "
+            "updated page: preserve all existing content, sections, and detail "
+            "verbatim, correcting only what's now outdated and folding in genuinely "
+            "new information. Do NOT condense, shorten, summarize, or drop sections "
+            "— the result must be at least as long and detailed as the current page. "
+            "Ignore any default length limit; length follows the source. Note "
+            "anything time-sensitive with its date.\n\n"
             f"--- CURRENT PAGE ---\n{existing['content']}\n\n"
             f"--- NEW RESEARCH ---\n{research}"
         )

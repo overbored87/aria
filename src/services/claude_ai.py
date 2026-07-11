@@ -261,7 +261,12 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
             if not cfg.openai_api_key:
                 return "Wiki writer not configured (missing OPENAI_API_KEY)."
             prompt = (
-                f"Update the following wiki page.\n\n"
+                "Update the following wiki page. This is a REVISION, not a summary — "
+                "treat it as a comprehensive, verbatim edit. Return the FULL updated "
+                "page, preserving all existing content and detail verbatim except "
+                "where the requested changes apply. Do NOT condense, shorten, or drop "
+                "sections; ignore any default length limit — length follows the "
+                "source.\n\n"
                 f"Current content:\n{tool_input['existing_content']}\n\n"
                 f"Changes requested: {tool_input['changes']}"
             )
