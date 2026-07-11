@@ -11,7 +11,7 @@ import uuid
 
 from src.services import web_search
 from src.services import dashboard as dashboard_svc
-from src.services.claude_ai import _call_wiki_writer
+from src.services.claude_ai import _call_wiki_writer, _WIKI_REVISER_SYSTEM
 from src.utils.logger import log
 
 
@@ -46,17 +46,9 @@ def run_research_and_draft(topic: str, slug: str | None = None, title: str | Non
         slug = existing["slug"]
         title = title or existing["title"]
         brief = (
-            f"Revise the existing wiki page '{title}'. This is a REVISION, not a "
-            "summary — treat it as a comprehensive, verbatim edit.\n\n"
-            "Below is the current page followed by fresh research. Return the FULL "
-            "updated page: preserve all existing content, sections, and detail "
-            "verbatim, correcting only what's now outdated and folding in genuinely "
-            "new information. Do NOT condense, shorten, summarize, or drop sections "
-            "— the result must be at least as long and detailed as the current page. "
-            "Ignore any default length limit; length follows the source. Note "
-            "anything time-sensitive with its date.\n\n"
-            f"--- CURRENT PAGE ---\n{existing['content']}\n\n"
-            f"--- NEW RESEARCH ---\n{research}"
+            f"--- CURRENT PAGE ('{title}') ---\n{existing['content']}\n\n"
+            f"--- REQUESTED CHANGES / NEW RESEARCH ---\n{research}\n\n"
+            "Note anything time-sensitive with its date."
         )
         edit_type = "update"
     else:
@@ -71,6 +63,23 @@ def run_research_and_draft(topic: str, slug: str | None = None, title: str | Non
         )
         edit_type = "create"
 
-    content = _call_wiki_writer(brief)
+    prev_words = len(existing["content"].split()) if existing else None
+    if edit_type == "update":
+        content = _call_wiki_writer(brief, system=_WIKI_REVISER_SYSTEM)
+        new_words = len(content.split())
+        if new_words < prev_words * 0.8:
+            log.warning(
+                f"Research update for '{slug}' shrank the page "
+                f"({prev_words} → {new_words} words) — review before approving"
+            )
+    else:
+        content = _call_wiki_writer(brief)
     log.info(f"Research {edit_type} ready: {slug} ({len(content.split())} words)")
-    return {"id": uuid.uuid4().hex[:8], "type": edit_type, "slug": slug, "title": title, "content": content}
+    return {
+        "id": uuid.uuid4().hex[:8],
+        "type": edit_type,
+        "slug": slug,
+        "title": title,
+        "content": content,
+        "prev_words": prev_words,
+    }

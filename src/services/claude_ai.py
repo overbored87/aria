@@ -181,6 +181,24 @@ _WIKI_WRITER_SYSTEM = (
     "Output markdown only — no commentary, no preamble."
 )
 
+# Separate system prompt for revising existing pages. The writer prompt's
+# "under 400 words" default makes GPT-4o condense pages on edits, even when
+# the user message argues otherwise — system-level defaults win. Revisions
+# therefore get their own system prompt with NO length ceiling.
+_WIKI_REVISER_SYSTEM = (
+    "You are a wiki editor revising an existing page. You will receive the "
+    "current page plus requested changes or new research. Return the COMPLETE "
+    "updated page in markdown.\n"
+    "Rules:\n"
+    "- Preserve the existing content, structure, sections, and voice. Text not "
+    "affected by the changes must be reproduced verbatim — do not paraphrase it.\n"
+    "- Apply only the requested changes: correct what's outdated, fold in new "
+    "information where it belongs, remove only what the changes explicitly remove.\n"
+    "- NEVER condense, summarize, or shorten the page. There is no length limit; "
+    "the output is normally at least as long as the input.\n"
+    "- Output markdown only — no commentary, no preamble."
+)
+
 
 _openai_client = None
 
@@ -193,14 +211,14 @@ def _get_openai_client():
     return _openai_client
 
 
-def _call_wiki_writer(prompt: str) -> str:
+def _call_wiki_writer(prompt: str, system: str = _WIKI_WRITER_SYSTEM) -> str:
     """Call GPT-4o to write wiki content. Returns markdown string."""
     try:
         response = _get_openai_client().chat.completions.create(
             model=cfg.openai_wiki_model,
-            max_tokens=4096,
+            max_tokens=8192,
             messages=[
-                {"role": "system", "content": _WIKI_WRITER_SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -261,16 +279,18 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
             if not cfg.openai_api_key:
                 return "Wiki writer not configured (missing OPENAI_API_KEY)."
             prompt = (
-                "Update the following wiki page. This is a REVISION, not a summary — "
-                "treat it as a comprehensive, verbatim edit. Return the FULL updated "
-                "page, preserving all existing content and detail verbatim except "
-                "where the requested changes apply. Do NOT condense, shorten, or drop "
-                "sections; ignore any default length limit — length follows the "
-                "source.\n\n"
-                f"Current content:\n{tool_input['existing_content']}\n\n"
-                f"Changes requested: {tool_input['changes']}"
+                f"Current page:\n{tool_input['existing_content']}\n\n"
+                f"Requested changes: {tool_input['changes']}"
             )
-            content = _call_wiki_writer(prompt)
+            content = _call_wiki_writer(prompt, system=_WIKI_REVISER_SYSTEM)
+            old_words = len(tool_input["existing_content"].split())
+            new_words = len(content.split())
+            description = ""
+            if new_words < old_words * 0.8:
+                # Surfaced in the approval preview so a condensed draft is
+                # visible before it can overwrite the page.
+                description = f"⚠️ draft shrank: {old_words} → {new_words} words"
+                log.warning(f"Wiki update for '{tool_input['slug']}' {description}")
             edit_id = str(uuid.uuid4())[:8]
             edit = {
                 "id": edit_id,
@@ -278,7 +298,7 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
                 "slug": tool_input["slug"],
                 "title": tool_input.get("title"),
                 "content": content,
-                "description": "",
+                "description": description,
             }
             _register_pending_edit(edit)
             wiki_edits.append(edit)

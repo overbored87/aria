@@ -58,10 +58,14 @@ def _run_research_job(job_id: str, args: dict) -> None:
         verb = "revised" if is_update else "drafted"
         jobstore.finish_job(job_id, result=f"{verb} '{edit['title']}'", edit=edit)
         if is_update:
+            prev = edit.get("prev_words")
+            size = f"{prev} → {words} words" if prev else f"{words} words"
             lead = (
                 f"\U0001F50E I researched \"{topic}\" and revised the existing page "
-                f"\"{edit['title']}\" into a {words}-word draft."
+                f"\"{edit['title']}\" ({size})."
             )
+            if prev and words < prev * 0.8:
+                lead += "\n\n⚠️ The draft is much shorter than the current page — review before saving."
         else:
             lead = (
                 f"\U0001F50E I researched \"{topic}\" and drafted a new {words}-word "
