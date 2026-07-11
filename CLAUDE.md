@@ -87,9 +87,17 @@ polling loop own the process's threading story.
 
 FastAPI app in a daemon thread (uvicorn signal handlers disabled — polling owns the
 main thread). Endpoints: `GET /health` (Railway healthcheck), `POST /invoke`
-(auth: `X-Siren-Key` == `SIREN_API_KEY`; only tool so far: `search_wiki`),
-`GET /jobs/{id}`. Phase B (`research_and_draft`) is planned — see
-`PLAN-aria-sidecar.md`.
+(auth: `X-Siren-Key` == `SIREN_API_KEY`), `GET /jobs/{id}`.
+
+`/invoke` tools: `search_wiki` (synchronous) and `research_and_draft` (async).
+The latter (`src/sidecar/research.py`) returns a `job_id` immediately, then a
+daemon thread runs Serper search + the GPT-4o wiki writer, stores the draft in
+the in-memory `jobs` store (`src/sidecar/jobs.py`, ephemeral — lost on restart),
+and DMs the user via Aria's own bot token with `/wiki_approve <job_id>` /
+`/wiki_reject <job_id>`. `_cmd_wiki_approve` reuses `_apply_wiki_edit` — the same
+path as the live-chat `/approve` flow — so drafts never auto-save and Siren never
+touches `wiki_pages` directly. Completion is also POSTed to Siren's `/events` for
+oversight. See `PLAN-aria-sidecar.md`.
 
 ## Env vars
 
