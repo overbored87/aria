@@ -71,12 +71,21 @@ One consolidated project holds everything: Aria's four tables (`aria_users`,
 `aria_conversations`, `aria_memories`, `aria_conversation_summaries` — see
 `src/db/migrate_to_new_project.sql`) plus the dashboard/wiki tables (`wiki_pages`).
 Both env-var pairs (`SUPABASE_*` and `DASHBOARD_SUPABASE_*`) now point at the **same
-project**; they're kept separate in code because the service key vs anon key differ
-and dashboard/wiki access is optional (`dashboard_svc.is_configured()`).
+project**; they're kept separate in code because the keys may differ and
+dashboard/wiki access is optional (`dashboard_svc.is_configured()`).
+
+**Key-role gotcha:** despite the name, `SUPABASE_SERVICE_KEY` holds an **anon**-role
+JWT, not a `service_role` key (decode the JWT's `role` claim to confirm). It works
+only because the aria_ tables have **no RLS**, so anon can read/write them freely.
+This matters for the wiki: `wiki_pages` may have RLS, so whether an approved edit
+actually writes depends on `DASHBOARD_SUPABASE_KEY` having write access (a
+`service_role` key, or an anon key plus a permissive write policy). If an edit
+"succeeds" but the page doesn't change, check that first — `_apply_wiki_edit` now
+reports honest failure and `update_wiki_page` logs a 0-row write, rather than
+silently forking a duplicate page.
 
 `src/db/migration.sql` is the historical pre-rename schema — don't run it; use
-`migrate_to_new_project.sql` for a fresh setup. No RLS on aria_ tables (service-key
-access only, personal project).
+`migrate_to_new_project.sql` for a fresh setup.
 
 There is **no reminders/scheduler/proactive-messaging feature** — that whole area
 (apscheduler, `reminders`/`scheduled_messages`/`proactive_message_log` tables) was
