@@ -513,8 +513,6 @@ host choice with the user before deploying — it changes Aria's hosting.
 
 ## Out of scope (do not build)
 
-- `propose_wiki_update`/research-into-existing-page — Phase B drafts new pages
-  only (`type: "create"`, which falls back to update if the slug exists).
 - Persisting jobs across restarts (they're intentionally ephemeral).
 - MCP migration of the contract (a separate, later roadmap item).
 - Any change to Aria's conversational behavior, memory, or scheduler.

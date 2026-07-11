@@ -50,17 +50,28 @@ def _run_research_job(job_id: str, args: dict) -> None:
     topic = args.get("topic", "").strip()
     try:
         edit = run_research_and_draft(topic, args.get("slug"), args.get("title"))
-        jobstore.finish_job(job_id, result=f"drafted '{edit['title']}'", edit=edit)
         words = len(edit["content"].split())
+        is_update = edit["type"] == "update"
+        verb = "revised" if is_update else "drafted"
+        jobstore.finish_job(job_id, result=f"{verb} '{edit['title']}'", edit=edit)
+        if is_update:
+            lead = (
+                f"\U0001F50E I researched \"{topic}\" and revised the existing page "
+                f"\"{edit['title']}\" into a {words}-word draft."
+            )
+        else:
+            lead = (
+                f"\U0001F50E I researched \"{topic}\" and drafted a new {words}-word "
+                f"page, \"{edit['title']}\"."
+            )
         _tg_send(
-            f"\U0001F50E I researched \"{topic}\" and drafted a {words}-word page, "
-            f"\"{edit['title']}\".\n\n/wiki_approve {job_id}  to save\n"
+            f"{lead}\n\n/wiki_approve {job_id}  to save\n"
             f"/wiki_reject {job_id}  to discard"
         )
         _log_to_siren(
             "research_drafted",
-            f"Drafted wiki page '{edit['title']}' from research on {topic}",
-            {"job_id": job_id, "slug": edit["slug"]},
+            f"{verb.capitalize()} wiki page '{edit['title']}' from research on {topic}",
+            {"job_id": job_id, "slug": edit["slug"], "mode": edit["type"]},
         )
     except Exception as e:
         jobstore.finish_job(job_id, error=str(e))

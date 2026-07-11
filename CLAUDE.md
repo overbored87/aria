@@ -94,7 +94,11 @@ The latter (`src/sidecar/research.py`) returns a `job_id` immediately, then a
 daemon thread runs Serper search + the GPT-4o wiki writer, stores the draft in
 the in-memory `jobs` store (`src/sidecar/jobs.py`, ephemeral — lost on restart),
 and DMs the user via Aria's own bot token with `/wiki_approve <job_id>` /
-`/wiki_reject <job_id>`. `_cmd_wiki_approve` reuses `_apply_wiki_edit` — the same
+`/wiki_reject <job_id>`. It drafts a new page, or **revises an existing one** if
+a page already exists at the target slug (explicit `slug` arg, else the slug
+derived from the title/topic) — in which case the writer is fed the current page
+content and briefed to revise rather than overwrite (`edit["type"]` is
+`create` vs `update`). `_cmd_wiki_approve` reuses `_apply_wiki_edit` — the same
 path as the live-chat `/approve` flow — so drafts never auto-save and Siren never
 touches `wiki_pages` directly. Completion is also POSTed to Siren's `/events` for
 oversight. See `PLAN-aria-sidecar.md`.
