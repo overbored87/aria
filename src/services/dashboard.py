@@ -213,8 +213,15 @@ def update_wiki_page(slug: str, content: str, title: str | None = None) -> dict 
             .execute()
         )
         if result.data:
-            log.info(f"Wiki page updated: {slug}")
+            log.info(f"Wiki page updated: {slug} ({len(result.data)} row)")
             return result.data[0]
+        # 0 rows written. Either no page has this slug, or the write was blocked
+        # (e.g. RLS on wiki_pages + a non-service key). Callers must not treat
+        # this as success — the page was not modified.
+        log.warning(
+            f"Wiki update wrote 0 rows for slug '{slug}' — page missing or "
+            f"write blocked (check wiki_pages RLS / dashboard key role)"
+        )
         return None
     except Exception as e:
         log.error(f"Wiki page update error: {e}")

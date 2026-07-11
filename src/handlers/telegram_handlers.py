@@ -368,18 +368,32 @@ def _apply_wiki_edit(edit: dict) -> bool:
         return result is not None
 
     if edit["type"] == "update":
+        # Decide create-vs-update by whether the page actually exists, rather
+        # than inferring it from a 0-row update. Otherwise a blocked write (RLS)
+        # or a wrong slug silently falls through to create — reporting success
+        # while the page the user meant is never touched (the "approved but
+        # nothing changed" bug).
+        exists = dashboard_svc.get_wiki_page(edit["slug"]) is not None
+        if not exists:
+            log.info(f"No page at '{edit['slug']}' — creating instead of updating")
+            result = dashboard_svc.create_wiki_page(
+                user_id=user_id,
+                title=edit.get("title") or edit["slug"],
+                slug=edit["slug"],
+                content=edit["content"],
+            )
+            return result is not None
+
         result = dashboard_svc.update_wiki_page(
             slug=edit["slug"],
             content=edit["content"],
             title=edit.get("title"),
         )
         if result is None:
-            # Page doesn't exist yet — create it instead
-            result = dashboard_svc.create_wiki_page(
-                user_id=user_id,
-                title=edit.get("title") or edit["slug"],
-                slug=edit["slug"],
-                content=edit["content"],
+            log.error(
+                f"Update of existing page '{edit['slug']}' wrote nothing — "
+                f"the write was blocked (check wiki_pages RLS / dashboard key role). "
+                f"Reporting failure instead of a silent no-op."
             )
         return result is not None
 
