@@ -5,13 +5,66 @@ Endpoints: GET /health, POST /invoke (X-Siren-Key auth), GET /jobs/{id}.
 """
 
 import os
+import threading
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 
+from src.config import cfg
 from src.services import dashboard as dashboard_svc
 from src.sidecar import jobs as jobstore
+from src.sidecar.research import run_research_and_draft
 
 app = FastAPI(title="Aria sidecar")
+
+
+def _tg_send(text: str) -> None:
+    """Notify the user in Aria's own voice, via her bot token — never Siren's."""
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage",
+            json={"chat_id": cfg.allowed_user_id, "text": text},
+            timeout=20.0,
+        )
+    except Exception:
+        pass  # notification is best-effort
+
+
+def _log_to_siren(event_type: str, summary: str, payload: dict) -> None:
+    """Federation oversight: tell Siren what happened, so she can see it in
+    get_agent_events even though she never touched the wiki herself."""
+    if not cfg.siren_base_url or not cfg.siren_api_key:
+        return
+    try:
+        httpx.post(
+            f"{cfg.siren_base_url.rstrip('/')}/events",
+            headers={"X-Siren-Key": cfg.siren_api_key},
+            json={"agent": "aria", "event_type": event_type, "summary": summary, "payload": payload},
+            timeout=15.0,
+        )
+    except Exception:
+        pass
+
+
+def _run_research_job(job_id: str, args: dict) -> None:
+    topic = args.get("topic", "").strip()
+    try:
+        edit = run_research_and_draft(topic, args.get("slug"), args.get("title"))
+        jobstore.finish_job(job_id, result=f"drafted '{edit['title']}'", edit=edit)
+        words = len(edit["content"].split())
+        _tg_send(
+            f"\U0001F50E I researched \"{topic}\" and drafted a {words}-word page, "
+            f"\"{edit['title']}\".\n\n/wiki_approve {job_id}  to save\n"
+            f"/wiki_reject {job_id}  to discard"
+        )
+        _log_to_siren(
+            "research_drafted",
+            f"Drafted wiki page '{edit['title']}' from research on {topic}",
+            {"job_id": job_id, "slug": edit["slug"]},
+        )
+    except Exception as e:
+        jobstore.finish_job(job_id, error=str(e))
+        _tg_send(f"⚠️ My research on \"{topic}\" hit a snag: {e}")
 
 
 def _auth(x_siren_key: str) -> None:
@@ -37,7 +90,13 @@ def invoke(body: dict, x_siren_key: str = Header(default="")):
         pages = dashboard_svc.search_wiki(args.get("query", ""))
         return {"result": [{"title": p["title"], "slug": p["slug"]} for p in pages]}
 
-    # research_and_draft is added in Phase B.
+    if tool == "research_and_draft":
+        if not (args.get("topic") or "").strip():
+            raise HTTPException(status_code=400, detail="topic is required")
+        job_id = jobstore.create_job(tool, args)
+        threading.Thread(target=_run_research_job, args=(job_id, args), daemon=True).start()
+        return {"job_id": job_id}
+
     raise HTTPException(status_code=400, detail=f"unknown tool: {tool}")
 
 

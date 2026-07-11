@@ -37,6 +37,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(CommandHandler("approve", _cmd_approve))
     app.add_handler(CommandHandler("reject", _cmd_reject))
+    app.add_handler(CommandHandler("wiki_approve", _cmd_wiki_approve))
+    app.add_handler(CommandHandler("wiki_reject", _cmd_wiki_reject))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message)
     )
@@ -391,6 +393,34 @@ async def _cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "❌ Wiki edit discarded." if count == 1 else f"❌ {count} wiki edits discarded."
     )
+
+
+async def _cmd_wiki_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approve a sidecar research draft (job-based — separate from /approve,
+    which handles edits proposed live in an active chat)."""
+    if not _is_authorized(update):
+        return
+    from src.sidecar import jobs as jobstore
+
+    if not context.args:
+        await update.message.reply_text("Usage: /wiki_approve <job_id>")
+        return
+    job = jobstore.get_job(context.args[0])
+    if not job or not job.get("edit"):
+        await update.message.reply_text("No such research draft (it may have expired).")
+        return
+    edit = job["edit"]
+    ok = await asyncio.to_thread(_apply_wiki_edit, edit)
+    await update.message.reply_text(
+        f"{'✅ Saved' if ok else '❌ Failed'}: {edit.get('title') or edit['slug']}"
+    )
+
+
+async def _cmd_wiki_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Discard a sidecar research draft without saving it."""
+    if not _is_authorized(update):
+        return
+    await update.message.reply_text("Discarded. Nothing was saved.")
 
 
 # ─── Multi-Message Sender ───────────────────────────────────
