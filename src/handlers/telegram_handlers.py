@@ -186,27 +186,17 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # ─── Photo Handler ───────────────────────────────────────────
 
+# Telegram delivers an album (media group) as one update per photo, all sharing
+# a media_group_id. Buffer them and flush shortly after the last one arrives so
+# Claude sees the whole album in a single call instead of replying per photo.
+_ALBUM_FLUSH_DELAY = 2.0  # seconds since last photo before processing
+_albums: dict[str, dict] = {}
 
-async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process incoming photos — download, encode, send to Claude for vision."""
-    if not _is_authorized(update):
-        uid = update.effective_user.id if update.effective_user else "unknown"
-        await update.message.reply_text(f"I'm spoken for 😏 (your ID: {uid})")
-        return
 
-    user = update.effective_user
-    user_id = user.id
-    caption = update.message.caption or ""
-
-    log.info(f"Photo from {user.first_name}: caption='{caption[:60]}...'")
-
-    ensure_user(user)
-
-    # Get the highest resolution photo
+async def _download_photo(update: Update) -> dict:
+    """Download the largest-resolution photo, resized to ≤1024px JPEG."""
     photo = update.message.photo[-1]  # last = largest
     photo_file = await photo.get_file()
-
-    # Download to bytes
     photo_bytes = await photo_file.download_as_bytearray()
 
     # Resize to max 1024px to reduce Claude vision token cost
@@ -225,30 +215,83 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         log.info(f"Photo unchanged: {img.size}, {len(photo_bytes)} bytes")
 
     b64_data = base64.b64encode(photo_bytes).decode("utf-8")
+    # Telegram photos are always JPEG
+    return {"base64": b64_data, "media_type": "image/jpeg"}
 
-    # Determine media type (Telegram photos are always JPEG)
-    media_type = "image/jpeg"
 
-    # Show typing
+async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process incoming photos — single, or buffered into an album."""
+    if not _is_authorized(update):
+        uid = update.effective_user.id if update.effective_user else "unknown"
+        await update.message.reply_text(f"I'm spoken for 😏 (your ID: {uid})")
+        return
+
+    user = update.effective_user
+    caption = update.message.caption or ""
+
+    log.info(f"Photo from {user.first_name}: caption='{caption[:60]}...'")
+
+    ensure_user(user)
+
+    group_id = update.message.media_group_id
+    if group_id:
+        # Buffer only (downloads happen at flush) so the debounce timer
+        # measures actual arrival gaps, not download time.
+        group = _albums.setdefault(group_id, {"updates": [], "captions": []})
+        group["updates"].append(update)
+        if caption:
+            group["captions"].append(caption)
+        # Debounce: restart the flush timer on each arrival
+        if task := group.get("task"):
+            task.cancel()
+        group["task"] = asyncio.create_task(_flush_album(group_id))
+        return
+
+    image = await _download_photo(update)
+    await _respond_to_photos(update, user.id, caption, [image])
+
+
+async def _flush_album(group_id: str) -> None:
+    """Wait out the debounce window, then process the buffered album."""
+    try:
+        await asyncio.sleep(_ALBUM_FLUSH_DELAY)
+    except asyncio.CancelledError:
+        return  # superseded by a newer photo in the same album
+    group = _albums.pop(group_id, None)
+    if not group:
+        return
+    updates = group["updates"]
+    caption = " ".join(group["captions"])
+    log.info(f"Album {group_id}: downloading {len(updates)} photos")
+    images = [await _download_photo(u) for u in updates]
+    update = updates[-1]
+    await _respond_to_photos(update, update.effective_user.id, caption, images)
+
+
+async def _respond_to_photos(
+    update: Update, user_id: int, caption: str, images: list[dict]
+) -> None:
+    """Shared pipeline: generate with vision, save, send, queue wiki edits."""
     await update.effective_chat.send_action("typing")
 
-    # Generate response with vision in a worker thread
-    image_data = {"base64": b64_data, "media_type": media_type}
     response_text, wiki_edits = await asyncio.to_thread(
-        generate_response, user_id, caption, image_data=image_data
+        generate_response, user_id, caption, images=images
     )
 
     # Save both messages AFTER generation
-    save_message(user_id, "user", f"[Sent a photo] {caption}".strip(), metadata={
+    count = len(images)
+    label = "[Sent a photo]" if count == 1 else f"[Sent {count} photos]"
+    save_message(user_id, "user", f"{label} {caption}".strip(), metadata={
         "message_id": update.message.message_id,
         "chat_id": update.effective_chat.id,
         "has_image": True,
+        "image_count": count,
     })
     save_message(user_id, "assistant", response_text)
 
     # Send split response
-    text_without_images, images = parse_images(response_text)
-    await _send_split_response(update, text_without_images, images)
+    text_without_images, response_images = parse_images(response_text)
+    await _send_split_response(update, text_without_images, response_images)
 
     # Send wiki edit previews
     await _queue_wiki_edits(update.effective_chat, wiki_edits)

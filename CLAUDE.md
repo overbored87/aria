@@ -40,6 +40,11 @@ directly from a handler). Messages are saved **after** generation so history doe
 double-include the current turn. Then: `parse_images` → split-send (4096-char chunks,
 Markdown with plain-text fallback) → `_queue_wiki_edits` → `maybe_summarize`.
 
+Telegram sends an album as one update per photo (shared `media_group_id`);
+`_handle_photo` buffers those in `_albums` and a debounced `_flush_album` task
+(2s after the last arrival) downloads them all and makes a single Claude call —
+so multi-screenshot wiki requests are seen whole, not answered per photo.
+
 ### Agentic loop (`generate_response`)
 
 Claude (`cfg.claude_model`) loops on `stop_reason == "tool_use"` with tools:

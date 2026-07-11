@@ -312,10 +312,11 @@ def _execute_tool(name: str, tool_input: dict, wiki_edits: list[dict]) -> str:
 
 
 def generate_response(
-    user_id: int, user_message: str, image_data: dict | None = None
+    user_id: int, user_message: str, images: list[dict] | None = None
 ) -> tuple[str, list[dict]]:
     """Generate Aria's response using an agentic tool loop.
 
+    images: list of {"base64": ..., "media_type": ...} — an album sends several.
     Returns (reply_text, wiki_edits_pending_approval)."""
     try:
         memories = get_active_memories(user_id)
@@ -323,18 +324,24 @@ def generate_response(
         history = get_recent_conversation(user_id)
         system = _build_system_prompt(memories, summaries)
 
-        if image_data:
-            user_content = [
+        if images:
+            user_content: list[dict] = [
                 {
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": image_data["media_type"],
-                        "data": image_data["base64"],
+                        "media_type": img["media_type"],
+                        "data": img["base64"],
                     },
-                },
-                {"type": "text", "text": user_message or "What do you see in this image?"},
+                }
+                for img in images
             ]
+            fallback = (
+                "What do you see in these images?"
+                if len(images) > 1
+                else "What do you see in this image?"
+            )
+            user_content.append({"type": "text", "text": user_message or fallback})
         else:
             user_content = user_message
 
@@ -342,7 +349,7 @@ def generate_response(
 
         log.info(
             f"Calling Claude: {len(history)} history msgs, {len(memories)} memories, "
-            f"has_image={image_data is not None}"
+            f"images={len(images) if images else 0}"
         )
 
         # ── Agentic tool loop ─────────────────────────────────
