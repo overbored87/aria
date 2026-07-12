@@ -76,32 +76,6 @@ def search(query: str, num_results: int = 5) -> list[dict]:
     return results
 
 
-def search_images(query: str, num_results: int = 3) -> list[dict]:
-    """
-    Search Google Images via Serper.
-    Returns list of {"title", "image_url", "link"}.
-    """
-    data = _post("images", {
-        "q": query,
-        "num": min(num_results, 10),
-        "gl": "sg",
-    })
-
-    if not data:
-        return []
-
-    results = []
-    for item in data.get("images", [])[:num_results]:
-        results.append({
-            "title": item.get("title", ""),
-            "image_url": item.get("imageUrl", ""),
-            "link": item.get("link", ""),
-        })
-
-    log.info(f"Image search: '{query}' → {len(results)} results")
-    return results
-
-
 def format_results_for_context(results: list[dict], max_results: int = 5) -> str:
     """Format search results into a string for Claude's context."""
     if not results:

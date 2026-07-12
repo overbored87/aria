@@ -159,8 +159,8 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     log.info(f"Message from {user.first_name}: {text[:80]}...")
 
-    # Ensure user exists
-    ensure_user(user)
+    # Ensure user exists (Supabase call — keep off the event loop)
+    await asyncio.to_thread(ensure_user, user)
 
     # Show typing indicator
     await update.effective_chat.send_action("typing")
@@ -169,11 +169,11 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     response_text, wiki_edits = await asyncio.to_thread(generate_response, user_id, text)
 
     # Save both messages AFTER generation (so history doesn't double-include the current message)
-    save_message(user_id, "user", text, metadata={
+    await asyncio.to_thread(save_message, user_id, "user", text, metadata={
         "message_id": update.message.message_id,
         "chat_id": update.effective_chat.id,
     })
-    save_message(user_id, "assistant", response_text)
+    await asyncio.to_thread(save_message, user_id, "assistant", response_text)
 
     # Extract images, then split into message chunks
     text_without_images, images = parse_images(response_text)
@@ -233,7 +233,7 @@ async def _handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     log.info(f"Photo from {user.first_name}: caption='{caption[:60]}...'")
 
-    ensure_user(user)
+    await asyncio.to_thread(ensure_user, user)
 
     group_id = update.message.media_group_id
     if group_id:
@@ -263,11 +263,22 @@ async def _flush_album(group_id: str) -> None:
     if not group:
         return
     updates = group["updates"]
-    caption = " ".join(group["captions"])
-    log.info(f"Album {group_id}: downloading {len(updates)} photos")
-    images = [await _download_photo(u) for u in updates]
     update = updates[-1]
-    await _respond_to_photos(update, update.effective_user.id, caption, images)
+    # This runs as a bare task — an uncaught exception would vanish into the
+    # event loop's "never retrieved" log and the user would see dead silence.
+    try:
+        caption = " ".join(group["captions"])
+        log.info(f"Album {group_id}: downloading {len(updates)} photos")
+        images = list(await asyncio.gather(*(_download_photo(u) for u in updates)))
+        await _respond_to_photos(update, update.effective_user.id, caption, images)
+    except Exception as e:
+        log.error(f"Album {group_id} processing failed: {e}", exc_info=True)
+        try:
+            await update.effective_chat.send_message(
+                "Something went wrong handling those photos — mind sending them again?"
+            )
+        except Exception:
+            pass
 
 
 async def _respond_to_photos(
@@ -283,13 +294,13 @@ async def _respond_to_photos(
     # Save both messages AFTER generation
     count = len(images)
     label = "[Sent a photo]" if count == 1 else f"[Sent {count} photos]"
-    save_message(user_id, "user", f"{label} {caption}".strip(), metadata={
+    await asyncio.to_thread(save_message, user_id, "user", f"{label} {caption}".strip(), metadata={
         "message_id": update.message.message_id,
         "chat_id": update.effective_chat.id,
         "has_image": True,
         "image_count": count,
     })
-    save_message(user_id, "assistant", response_text)
+    await asyncio.to_thread(save_message, user_id, "assistant", response_text)
 
     # Send split response
     text_without_images, response_images = parse_images(response_text)
@@ -309,6 +320,10 @@ async def _queue_wiki_edits(chat, wiki_edits: list[dict]) -> None:
     global _pending_approval
     if not wiki_edits:
         return
+    # New proposals supersede any un-actioned ones — clear those from the
+    # claude_ai registry too, or they linger until the cap prunes them.
+    for old in _pending_approval:
+        remove_pending_wiki_edit(old["id"])
     _pending_approval = list(wiki_edits)
     for edit in wiki_edits:
         await _send_wiki_preview(chat, edit)
@@ -510,7 +525,8 @@ async def _cb_wiki(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     job = jobstore.get_job(job_id)
     if not job or not job.get("edit"):
         await query.edit_message_text(
-            "This draft expired (Aria restarted). Ask again and I'll re-run it."
+            "This draft is gone — already handled, or lost to a restart. "
+            "Ask again and I'll re-run it."
         )
         return
 

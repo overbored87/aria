@@ -454,6 +454,11 @@ def generate_response(
         if wiki_edits:
             log.info(f"Wiki edits pending approval: {[e['id'] for e in wiki_edits]}")
 
+        # If the reply was nothing but tags (e.g. only a <memory>), the stripped
+        # text is empty and the handler would send nothing — dead silence.
+        if not clean_text.strip() and not wiki_edits:
+            clean_text = "Noted 👍"
+
         return clean_text, wiki_edits
 
     except anthropic.RateLimitError:

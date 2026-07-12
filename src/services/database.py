@@ -134,25 +134,6 @@ def get_active_memories(user_id: int, limit: int = 30) -> list[dict]:
     return result.data or []
 
 
-def get_memories_by_category(user_id: int, category: str, limit: int = 10) -> list[dict]:
-    db = get_db()
-    result = (
-        db.table("aria_memories")
-        .select("id, content, importance, created_at")
-        .eq("user_id", user_id)
-        .eq("category", category)
-        .eq("is_active", True)
-        .order("importance", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    return result.data or []
-
-
-def deactivate_memory(memory_id: str) -> None:
-    get_db().table("aria_memories").update({"is_active": False}).eq("id", memory_id).execute()
-
-
 def deactivate_memories_matching(user_id: int, search_text: str) -> int:
     """Deactivate all active memories whose content contains search_text (case-insensitive).
     Returns number of memories deactivated."""
