@@ -60,6 +60,16 @@ def write_entry(
         # Network-level failure — Siren should retry rather than drop the entry.
         raise RuntimeError(f"Journal API unreachable: {e}") from e
 
+    # Redirects aren't followed on purpose: /login would answer 200 with HTML
+    # and look like success. A 3xx here means the endpoint sits behind auth
+    # middleware, or the URL is off (trailing slash, www, http vs https).
+    if 300 <= response.status_code < 400:
+        raise RuntimeError(
+            f"Journal API redirected ({response.status_code}) to "
+            f"{response.headers.get('location', 'unknown')} — the endpoint is "
+            f"behind auth middleware, or JOURNAL_API_URL is wrong"
+        )
+
     if response.status_code not in (200, 201):
         detail = response.text[:200]
         raise RuntimeError(f"Journal API returned {response.status_code}: {detail}")
