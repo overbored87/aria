@@ -46,6 +46,11 @@ class Config:
     dashboard_supabase_url: str = os.getenv("DASHBOARD_SUPABASE_URL", "")
     dashboard_supabase_key: str = os.getenv("DASHBOARD_SUPABASE_KEY", "")
 
+    # Day Two journal ingest (optional — HTTP, not a DB connection: Day Two's
+    # tables are RLS-locked to auth.uid(), so writes go through its API route)
+    journal_api_url: str = os.getenv("JOURNAL_API_URL", "")
+    journal_api_key: str = os.getenv("JOURNAL_API_KEY", "")
+
     # App
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 

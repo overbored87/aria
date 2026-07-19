@@ -12,8 +12,11 @@ from fastapi import FastAPI, Header, HTTPException
 
 from src.config import cfg
 from src.services import dashboard as dashboard_svc
+from src.services import journal as journal_svc
+from src.services.claude_ai import extract_memories_from_entry
 from src.sidecar import jobs as jobstore
 from src.sidecar.research import run_research_and_draft
+from src.utils.logger import log
 
 app = FastAPI(title="Aria sidecar")
 
@@ -120,6 +123,44 @@ def invoke(body: dict, x_siren_key: str = Header(default="")):
         job_id = jobstore.create_job(tool, args)
         threading.Thread(target=_run_research_job, args=(job_id, args), daemon=True).start()
         return {"job_id": job_id}
+
+    if tool == "journal_write":
+        # Synchronous on purpose. Unlike research_and_draft, this content is the
+        # user's own words composed by Siren in conversation — there is nothing
+        # for the user to approve, and the caller needs to know it landed.
+        content = (args.get("content") or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="content is required")
+        if not journal_svc.is_configured():
+            raise HTTPException(status_code=503, detail="journal ingest not configured")
+
+        try:
+            entry = journal_svc.write_entry(
+                content=content,
+                title=args.get("title"),
+                created_at=args.get("created_at"),
+                source=args.get("source") or "siren",
+            )
+        except RuntimeError as e:
+            # Never report success for an entry that didn't land — Siren must be
+            # able to buffer and retry rather than silently lose a reflection.
+            log.error(f"Journal write failed: {e}")
+            raise HTTPException(status_code=502, detail=str(e))
+
+        # The entry is safe now; harvesting memories is a best-effort follow-up
+        # and runs in the background so the voice path isn't kept waiting.
+        threading.Thread(
+            target=extract_memories_from_entry,
+            args=(cfg.allowed_user_id, content),
+            daemon=True,
+        ).start()
+
+        _log_to_siren(
+            "journal_written",
+            f"Saved journal entry '{entry.get('title')}' ({len(content.split())} words)",
+            {"entry_id": entry.get("id"), "source": args.get("source") or "siren"},
+        )
+        return {"result": entry}
 
     raise HTTPException(status_code=400, detail=f"unknown tool: {tool}")
 

@@ -497,6 +497,47 @@ def generate_summary(messages: list[dict]) -> str | None:
         return None
 
 
+# ─── Journal Memory Extraction ──────────────────────────────
+
+_MEMORY_EXTRACT_SYSTEM = (
+    "Extract durable personal facts from the journal entry — things still worth "
+    "knowing weeks from now: decisions, changes in circumstance, relationships, "
+    "goals, health, work, preferences. Ignore passing mood and day-to-day detail; "
+    "an entry with nothing durable in it should yield nothing.\n\n"
+    "Output ONLY memory tags, one per fact, or an empty response:\n"
+    '<memory category="personal|preference|goal|task|relationship|habit|work|health|'
+    'interest|other" importance="1-10">fact</memory>'
+)
+
+
+def extract_memories_from_entry(user_id: int, text: str) -> int:
+    """Pull durable facts out of a journal entry into long-term memory.
+
+    Best-effort by design: the entry itself is already safely stored, so a
+    failure here must never surface as a failed journal write. Returns the
+    number of memories saved."""
+    try:
+        response = get_client().messages.create(
+            model=cfg.claude_model,
+            max_tokens=1000,
+            system=_MEMORY_EXTRACT_SYSTEM,
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = "".join(b.text for b in response.content if b.type == "text")
+        _, memories = _parse_memories(raw)
+        for m in memories:
+            save_memory(user_id, m["category"], m["content"], m["importance"])
+        if memories:
+            log.info(
+                f"Journal: extracted {len(memories)} memories "
+                f"{[m['category'] for m in memories]}"
+            )
+        return len(memories)
+    except Exception as e:
+        log.error(f"Journal memory extraction failed: {e}")
+        return 0
+
+
 # ─── Tag Parsers ─────────────────────────────────────────────
 
 _MEMORY_RE = re.compile(

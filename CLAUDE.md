@@ -98,7 +98,23 @@ FastAPI app in a daemon thread (uvicorn signal handlers disabled — polling own
 main thread). Endpoints: `GET /health` (Railway healthcheck), `POST /invoke`
 (auth: `X-Siren-Key` == `SIREN_API_KEY`), `GET /jobs/{id}`.
 
-`/invoke` tools: `search_wiki` (synchronous) and `research_and_draft` (async).
+`/invoke` tools: `search_wiki` and `journal_write` (synchronous), and
+`research_and_draft` (async).
+
+**`journal_write`** persists a journal entry to Day Two (`src/services/journal.py`).
+Day Two is a **separate Supabase project with RLS bound to `auth.uid()`**, so there
+is no server-side DB write available — entries go over HTTP to its
+`POST /api/journal` route, which holds the `service_role` key and owns the schema
+(`JOURNAL_API_URL`/`JOURNAL_API_KEY`). Siren composes the entry in her own
+conversation and this stores it **verbatim** — nothing here rewrites or summarises
+it, deliberately (contrast the wiki writer, which drafts prose). Synchronous, with
+no approval step: the text is the user's own words, already agreed in Siren's chat.
+A failed write returns 502 rather than a false success, so Siren can retry instead
+of losing a reflection. After the entry is safely stored, durable facts are
+harvested into `aria_memories` in a background thread
+(`claude_ai.extract_memories_from_entry`) — best-effort, never blocks or fails the
+write. That memory harvest is the reason journaling routes through Aria at all
+rather than Siren writing to Day Two directly.
 The latter (`src/sidecar/research.py`) returns a `job_id` immediately, then a
 daemon thread runs Serper search + the GPT-4o wiki writer, stores the draft in
 the in-memory `jobs` store (`src/sidecar/jobs.py`, ephemeral — lost on restart),
@@ -127,7 +143,8 @@ Set in Railway dashboard for prod (deployed services never read `.env`):
   `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`
 - Optional: `ALLOWED_USER_IDS` (comma-separated extras), `OPENAI_API_KEY` (wiki
   writer), `SERPER_API_KEY` (web search), `DASHBOARD_SUPABASE_URL`/`DASHBOARD_SUPABASE_KEY`
-  (wiki), `SIREN_API_KEY`/`SIREN_BASE_URL` (sidecar), `USER_TIMEZONE`, `LOG_LEVEL`, `PORT`
+  (wiki), `SIREN_API_KEY`/`SIREN_BASE_URL` (sidecar), `JOURNAL_API_URL`/`JOURNAL_API_KEY`
+  (Day Two journal ingest), `USER_TIMEZONE`, `LOG_LEVEL`, `PORT`
 
 Model IDs and caps live in `config.py` as code defaults (`claude-sonnet-5`, `gpt-4o`,
 `max_tokens=8192`), not env vars.
